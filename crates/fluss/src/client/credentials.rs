@@ -69,10 +69,16 @@ impl CachedToken {
 
 fn convert_hadoop_key_to_opendal(hadoop_key: &str) -> Option<String> {
     match hadoop_key {
+        // Standard S3A keys
         "fs.s3a.endpoint" => Some("endpoint".to_string()),
         "fs.s3a.endpoint.region" => Some("region".to_string()),
         "fs.s3a.path.style.access" => Some("enable_virtual_host_style".to_string()),
         "fs.s3a.connection.ssl.enabled" => None,
+        // Red-S3 keys (Fluss custom format)
+        "fs.red-s3.endpoint" => Some("endpoint".to_string()),
+        "fs.red-s3.region" => Some("region".to_string()),
+        "fs.red-s3.path-style-access" => Some("enable_virtual_host_style".to_string()),
+        "fs.red-s3.connection.ssl.enabled" => None,
         _ => None,
     }
 }

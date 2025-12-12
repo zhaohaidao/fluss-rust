@@ -42,3 +42,7 @@ path = "src/scan_from_earliest.rs"
 [[example]]
 name = "scan-local-only"
 path = "src/scan_local_only.rs"
+
+[[example]]
+name = "debug-credentials"
+path = "src/debug_credentials.rs"
