@@ -229,12 +229,20 @@ impl RemoteLogDownloader {
 
         // Stream data from remote to local file in chunks
         // opendal::Reader::read accepts a range, so we read in chunks
-        const CHUNK_SIZE: u64 = 64 * 1024; // 64KB chunks for efficient streaming
+        const CHUNK_SIZE: u64 = 8 * 1024 * 1024; // 8MB chunks for efficient streaming
         let mut offset = 0u64;
+        let mut chunk_count = 0u64;
+        let total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        eprintln!("[DEBUG] Starting download: {} bytes in {} chunks", file_size, total_chunks);
 
         while offset < file_size {
             let end = std::cmp::min(offset + CHUNK_SIZE, file_size);
             let range = offset..end;
+            chunk_count += 1;
+
+            if chunk_count <= 3 || chunk_count % 10 == 0 {
+                eprintln!("[DEBUG] Reading chunk {}/{} (offset {})", chunk_count, total_chunks, offset);
+            }
 
             // Read chunk from remote storage with timeout
             let read_future = op.read_with(relative_path).range(range.clone());
