@@ -45,7 +45,7 @@ pub async fn main() -> Result<()> {
     println!("   Table obtained successfully!");
 
     let table_info = table.table_info();
-    let num_buckets = table_info.num_buckets();
+    let num_buckets = table_info.num_buckets;
     println!("   Table has {} buckets", num_buckets);
 
     println!("4) Creating log scanner...");
@@ -61,8 +61,9 @@ pub async fn main() -> Result<()> {
     println!("6) Polling records (timeout: 10 seconds)...");
     let scan_records = log_scanner.poll(Duration::from_secs(10)).await?;
     
-    println!("Scanned records: {}", scan_records.len());
-    for (i, record) in scan_records.iter().enumerate() {
+    let record_count = scan_records.count();
+    println!("Scanned records: {}", record_count);
+    for (i, record) in scan_records.into_iter().enumerate() {
         let row = record.row();
         if i < 10 {
             println!(
@@ -77,8 +78,8 @@ pub async fn main() -> Result<()> {
         }
     }
     
-    if scan_records.len() > 10 {
-        println!(" ... and {} more records", scan_records.len() - 10);
+    if record_count > 10 {
+        println!(" ... and {} more records", record_count - 10);
     }
 
     println!("\n7) Creating log scanner with projection (columns 0, 1)...");
@@ -96,10 +97,11 @@ pub async fn main() -> Result<()> {
     println!("9) Polling projected records (timeout: 10 seconds)...");
     let projected_records = projected_scanner.poll(Duration::from_secs(10)).await?;
     
-    println!("Projected records: {}", projected_records.len());
+    let projected_count = projected_records.count();
+    println!("Projected records: {}", projected_count);
     
     let mut projection_verified = true;
-    for (i, record) in projected_records.iter().enumerate() {
+    for (i, record) in projected_records.into_iter().enumerate() {
         let row = record.row();
         let field_count = row.field_count();
         
@@ -114,8 +116,8 @@ pub async fn main() -> Result<()> {
         }
     }
     
-    if projected_records.len() > 10 {
-        println!("  ... and {} more records", projected_records.len() - 10);
+    if projected_count > 10 {
+        println!("  ... and {} more records", projected_count - 10);
     }
     
     if projection_verified {

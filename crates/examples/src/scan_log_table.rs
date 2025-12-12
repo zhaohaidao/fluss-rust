@@ -44,7 +44,7 @@ pub async fn main() -> Result<()> {
     println!("   Table obtained successfully!");
 
     let table_info = table.table_info();
-    let num_buckets = table_info.num_buckets();
+    let num_buckets = table_info.num_buckets;
     println!("   Table has {} buckets", num_buckets);
 
     println!("4) Creating log scanner...");
@@ -60,8 +60,8 @@ pub async fn main() -> Result<()> {
     println!("6) Polling records (timeout: 5 seconds)...");
     let scan_records = log_scanner.poll(Duration::from_secs(5)).await?;
     
-    println!("Scanned records: {}", scan_records.len());
-    for record in &scan_records {
+    println!("Scanned records: {}", scan_records.count());
+    for record in scan_records {
         let row = record.row();
         println!(
             " offset={} id={} name={} score={} age={} ts={}",
@@ -89,10 +89,11 @@ pub async fn main() -> Result<()> {
     println!("9) Polling projected records (timeout: 5 seconds)...");
     let projected_records = projected_scanner.poll(Duration::from_secs(5)).await?;
     
-    println!("Projected records: {}", projected_records.len());
+    let count = projected_records.count();
+    println!("Projected records: {}", count);
     
     let mut projection_verified = true;
-    for (i, record) in projected_records.iter().enumerate() {
+    for (i, record) in projected_records.into_iter().enumerate() {
         let row = record.row();
         let field_count = row.field_count();
         
