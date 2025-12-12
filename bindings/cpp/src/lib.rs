@@ -403,7 +403,10 @@ impl Table {
         let fluss_table =
             fcore::client::FlussTable::new(&self.connection, self.metadata.clone(), self.table_info.clone());
 
-        let scanner = fluss_table.new_scan().create_log_scanner();
+        let scanner = match fluss_table.new_scan().create_log_scanner() {
+            Ok(s) => s,
+            Err(e) => return Err(format!("Failed to create log scanner: {}", e)),
+        };
         let scanner = Box::into_raw(Box::new(LogScanner { inner: scanner }));
         Ok(scanner)
     }
@@ -417,7 +420,10 @@ impl Table {
             Ok(s) => s,
             Err(e) => return Err(format!("Failed to project columns: {}", e)),
         };
-        let scanner = scan.create_log_scanner();
+        let scanner = match scan.create_log_scanner() {
+            Ok(s) => s,
+            Err(e) => return Err(format!("Failed to create log scanner: {}", e)),
+        };
         let scanner = Box::into_raw(Box::new(LogScanner { inner: scanner }));
         Ok(scanner)
     }
