@@ -15,16 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod admin;
-mod connection;
-mod credentials;
-mod metadata;
-mod table;
-mod write;
+use crate::error::Result;
+use opendal::services::S3Config;
+use opendal::Configurator;
+use opendal::Operator;
+use std::collections::HashMap;
 
-pub use admin::*;
-pub use connection::*;
-pub use credentials::*;
-pub use metadata::*;
-pub use table::*;
-pub use write::*;
+pub(crate) fn s3_config_build(props: &HashMap<String, String>) -> Result<Operator> {
+    let config = S3Config::from_iter(props.clone())?;
+    Ok(Operator::from_config(config)?.finish())
+}
+
+pub(crate) fn parse_s3_path(path: &str) -> (&str, &str) {
+    let path = path
+        .strip_prefix("s3a://")
+        .or_else(|| path.strip_prefix("s3://"))
+        .unwrap_or(path);
+
+    match path.find('/') {
+        Some(idx) => (&path[..idx], &path[idx + 1..]),
+        None => (path, ""),
+    }
+}
+
