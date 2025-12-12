@@ -175,6 +175,16 @@ impl RemoteLogDownloader {
         local_path: &Path,
         s3_props: &HashMap<String, String>,
     ) -> Result<PathBuf> {
+        eprintln!("[DEBUG] download_file called: remote_path={}", remote_path);
+        eprintln!("[DEBUG] s3_props count: {}", s3_props.len());
+        for (k, v) in s3_props {
+            if k.contains("key") || k.contains("secret") {
+                eprintln!("[DEBUG]   {} = {}...", k, &v[..std::cmp::min(8, v.len())]);
+            } else {
+                eprintln!("[DEBUG]   {} = {}", k, v);
+            }
+        }
+        
         // Handle both URL (e.g., "s3://bucket/path") and local file paths
         // If the path doesn't contain "://", treat it as a local file path
         let remote_log_tablet_dir_url = if remote_log_tablet_dir.contains("://") {
@@ -202,6 +212,7 @@ impl RemoteLogDownloader {
         // Timeout for remote storage operations (30 seconds)
         const REMOTE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+        eprintln!("[DEBUG] Calling stat on: {}", relative_path);
         // Get file metadata to know the size with timeout
         let stat_future = op.stat(relative_path);
         let meta = tokio::time::timeout(REMOTE_OP_TIMEOUT, stat_future)
@@ -211,6 +222,7 @@ impl RemoteLogDownloader {
                 format!("Timeout getting file metadata from remote storage: {}", remote_path)
             )))??;
         let file_size = meta.content_length();
+        eprintln!("[DEBUG] stat succeeded, file_size={}", file_size);
 
         // Create local file for writing
         let mut local_file = tokio::fs::File::create(local_path).await?;
