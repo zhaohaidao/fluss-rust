@@ -16,14 +16,23 @@
 // under the License.
 
 use crate::error::Result;
+use opendal::layers::TimeoutLayer;
 use opendal::services::S3Config;
 use opendal::Configurator;
 use opendal::Operator;
 use std::collections::HashMap;
+use std::time::Duration;
 
 pub(crate) fn s3_config_build(props: &HashMap<String, String>) -> Result<Operator> {
     let config = S3Config::from_iter(props.clone())?;
-    Ok(Operator::from_config(config)?.finish())
+    let op = Operator::from_config(config)?.finish();
+    
+    // Add timeout layer to prevent hanging on S3 operations
+    let timeout_layer = TimeoutLayer::new()
+        .with_timeout(Duration::from_secs(10))
+        .with_io_timeout(Duration::from_secs(30));
+    
+    Ok(op.layer(timeout_layer))
 }
 
 pub(crate) fn parse_s3_path(path: &str) -> (&str, &str) {

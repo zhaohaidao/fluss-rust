@@ -199,8 +199,17 @@ impl RemoteLogDownloader {
         let storage = Storage::build(file_io_builder)?;
         let (op, relative_path) = storage.create(remote_path)?;
 
-        // Get file metadata to know the size
-        let meta = op.stat(relative_path).await?;
+        // Timeout for remote storage operations (30 seconds)
+        const REMOTE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        // Get file metadata to know the size with timeout
+        let stat_future = op.stat(relative_path);
+        let meta = tokio::time::timeout(REMOTE_OP_TIMEOUT, stat_future)
+            .await
+            .map_err(|_| Error::Io(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("Timeout getting file metadata from remote storage: {}", remote_path)
+            )))??;
         let file_size = meta.content_length();
 
         // Create local file for writing
@@ -215,8 +224,14 @@ impl RemoteLogDownloader {
             let end = std::cmp::min(offset + CHUNK_SIZE, file_size);
             let range = offset..end;
 
-            // Read chunk from remote storage
-            let chunk = op.read_with(relative_path).range(range.clone()).await?;
+            // Read chunk from remote storage with timeout
+            let read_future = op.read_with(relative_path).range(range.clone());
+            let chunk = tokio::time::timeout(REMOTE_OP_TIMEOUT, read_future)
+                .await
+                .map_err(|_| Error::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("Timeout reading chunk from remote storage: {} at offset {}", remote_path, offset)
+                )))??;
             let bytes = chunk.to_bytes();
 
             // Write chunk to local file
