@@ -30,3 +30,11 @@ clap = { workspace = true}
 [[example]]
 name = "example-table"
 path = "src/example_table.rs"
+
+[[example]]
+name = "scan-log-table"
+path = "src/scan_log_table.rs"
+
+[[example]]
+name = "scan-from-earliest"
+path = "src/scan_from_earliest.rs"

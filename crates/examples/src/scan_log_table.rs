@@ -1,0 +1,117 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use fluss::client::FlussConnection;
+use fluss::config::Config;
+use fluss::error::Result;
+use fluss::metadata::TablePath;
+use fluss::row::InternalRow;
+use std::time::Duration;
+
+#[tokio::main]
+pub async fn main() -> Result<()> {
+    println!("Starting Rust scan log table example...");
+
+    let mut config = Config::default();
+    config.bootstrap_server = Some("10.147.136.86:9123".to_string());
+
+    println!("1) Connecting to Fluss...");
+    let conn = FlussConnection::new(config).await?;
+    println!("   Connected successfully!");
+
+    println!("2) Getting admin...");
+    let _admin = conn.get_admin().await?;
+    println!("   Admin obtained successfully!");
+
+    let table_path = TablePath::new("fluss".to_owned(), "mahong_log_table_cpp_test_1212".to_owned());
+
+    println!("3) Getting table: {}", table_path);
+    let table = conn.get_table(&table_path).await?;
+    println!("   Table obtained successfully!");
+
+    let table_info = table.table_info();
+    let num_buckets = table_info.num_buckets();
+    println!("   Table has {} buckets", num_buckets);
+
+    println!("4) Creating log scanner...");
+    let log_scanner = table.new_scan().create_log_scanner()?;
+    println!("   Log scanner created successfully!");
+
+    println!("5) Subscribing to all buckets from offset 0...");
+    for bucket_id in 0..num_buckets {
+        log_scanner.subscribe(bucket_id, 0).await?;
+        println!("   Subscribed to bucket {}", bucket_id);
+    }
+
+    println!("6) Polling records (timeout: 5 seconds)...");
+    let scan_records = log_scanner.poll(Duration::from_secs(5)).await?;
+    
+    println!("Scanned records: {}", scan_records.len());
+    for record in &scan_records {
+        let row = record.row();
+        println!(
+            " offset={} id={} name={} score={} age={} ts={}",
+            record.offset(),
+            row.get_int(0),
+            row.get_string(1),
+            row.get_float(2),
+            row.get_int(3),
+            record.timestamp()
+        );
+    }
+
+    println!("\n7) Creating log scanner with projection (columns 0, 1)...");
+    let projected_scanner = table.new_scan()
+        .project(&[0, 1])?
+        .create_log_scanner()?;
+    println!("   Projected scanner created successfully!");
+
+    println!("8) Subscribing projected scanner to all buckets from offset 0...");
+    for bucket_id in 0..num_buckets {
+        projected_scanner.subscribe(bucket_id, 0).await?;
+        println!("   Subscribed to bucket {}", bucket_id);
+    }
+
+    println!("9) Polling projected records (timeout: 5 seconds)...");
+    let projected_records = projected_scanner.poll(Duration::from_secs(5)).await?;
+    
+    println!("Projected records: {}", projected_records.len());
+    
+    let mut projection_verified = true;
+    for (i, record) in projected_records.iter().enumerate() {
+        let row = record.row();
+        let field_count = row.field_count();
+        
+        if field_count != 2 {
+            eprintln!("ERROR: Record {} has {} fields, expected 2", i, field_count);
+            projection_verified = false;
+            continue;
+        }
+        
+        println!("  Record {}: id={}, name={}", i, row.get_int(0), row.get_string(1));
+    }
+    
+    if projection_verified {
+        println!("\nColumn pruning verification passed!");
+    } else {
+        eprintln!("\nColumn pruning verification failed!");
+        std::process::exit(1);
+    }
+
+    println!("\nRust example completed successfully!");
+    Ok(())
+}
