@@ -562,7 +562,8 @@ fn parse_ipc_message(
     let message = root_as_message(metadata_bytes).ok()?;
     let batch_metadata = message.header_as_record_batch()?;
 
-    let body_start = 8 + metadata_size;
+    let metadata_padded_size = (metadata_size + 7) & !7;
+    let body_start = 8 + metadata_padded_size;
     let body_data = &data[body_start..];
     let body_buffer = Buffer::from(body_data);
 
