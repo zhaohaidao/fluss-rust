@@ -43,6 +43,10 @@ name = "scan-from-earliest"
 path = "src/scan_from_earliest.rs"
 
 [[example]]
+name = "scan-from-ts"
+path = "src/scan_from_ts.rs"
+
+[[example]]
 name = "scan-local-only"
 path = "src/scan_local_only.rs"
 
