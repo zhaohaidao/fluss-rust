@@ -65,38 +65,38 @@ pub async fn main() -> Result<()> {
         OffsetSpec::Timestamp(timestamp_ms as i64)
     ).await?;
 
-    println!("4) Creating log scanner...");
-    let log_scanner = table.new_scan().create_log_scanner()?;
-    println!("   Log scanner created successfully!");
+    // println!("4) Creating log scanner...");
+    // let log_scanner = table.new_scan().create_log_scanner()?;
+    // println!("   Log scanner created successfully!");
 
-    println!("5) Subscribing to all buckets from timestamp {}...", timestamp_ms);
-    for (bucket_id, offset) in offsets {
-        log_scanner.subscribe(bucket_id, offset).await?;
-        println!("   Subscribed to bucket {} from timestamp {} offset {}", bucket_id, timestamp_ms, offset);
-    }
+    // println!("5) Subscribing to all buckets from timestamp {}...", timestamp_ms);
+    // for (bucket_id, offset) in offsets {
+    //     log_scanner.subscribe(bucket_id, offset).await?;
+    //     println!("   Subscribed to bucket {} from timestamp {} offset {}", bucket_id, timestamp_ms, offset);
+    // }
 
-    println!("6) Polling records (timeout: 10 seconds)...");
-    let scan_records = log_scanner.poll(Duration::from_secs(10)).await?;
+    // println!("6) Polling records (timeout: 10 seconds)...");
+    // let scan_records = log_scanner.poll(Duration::from_secs(10)).await?;
 
-    let record_count = scan_records.count();
-    println!("Scanned records: {}", record_count);
-    for (i, record) in scan_records.into_iter().enumerate() {
-        let row = record.row();
-        if i < 10 {
-            println!(
-                " offset={} id={} number={} value={} ts={}",
-                record.offset(),
-                row.get_long(0),
-                row.get_int(1),
-                row.get_string(2),
-                record.timestamp()
-            );
-        }
-    }
+    // let record_count = scan_records.count();
+    // println!("Scanned records: {}", record_count);
+    // for (i, record) in scan_records.into_iter().enumerate() {
+    //     let row = record.row();
+    //     if i < 10 {
+    //         println!(
+    //             " offset={} id={} number={} value={} ts={}",
+    //             record.offset(),
+    //             row.get_long(0),
+    //             row.get_int(1),
+    //             row.get_string(2),
+    //             record.timestamp()
+    //         );
+    //     }
+    // }
 
-    if record_count > 10 {
-        println!(" ... and {} more records", record_count - 10);
-    }
+    // if record_count > 10 {
+    //     println!(" ... and {} more records", record_count - 10);
+    // }
 
     println!("\n7) Creating log scanner with projection (columns 0, 1)...");
     let projected_scanner = table.new_scan()
@@ -111,40 +111,42 @@ pub async fn main() -> Result<()> {
         println!("   Subscribed to bucket {} from earliest", bucket_id);
     }
 
-    println!("9) Polling projected records (timeout: 10 seconds)...");
-    let projected_records = projected_scanner.poll(Duration::from_secs(10)).await?;
+    loop {
+        println!("9) Polling projected records (timeout: 10 seconds)...");
+        let projected_records = projected_scanner.poll(Duration::from_secs(10)).await?;
 
-    let projected_count = projected_records.count();
-    println!("Projected records: {}", projected_count);
+        let projected_count = projected_records.count();
+        println!("Projected records: {}", projected_count);
 
-    let mut projection_verified = true;
-    for (i, record) in projected_records.into_iter().enumerate() {
-        let row = record.row();
-        let field_count = row.get_field_count();
+        let mut projection_verified = true;
+        for (i, record) in projected_records.into_iter().enumerate() {
+            let row = record.row();
+            let field_count = row.get_field_count();
 
-        if field_count != 2 {
-            eprintln!("ERROR: Record {} has {} fields, expected 2", i, field_count);
-            projection_verified = false;
-            continue;
+            if field_count != 2 {
+                eprintln!("ERROR: Record {} has {} fields, expected 2", i, field_count);
+                projection_verified = false;
+                continue;
+            }
+
+            if i < 10 {
+                println!("  Record {}: id={}, name={}", i, row.get_long(0), row.get_string(1));
+            }
         }
 
-        if i < 10 {
-            println!("  Record {}: id={}, name={}", i, row.get_long(0), row.get_string(1));
+        if projected_count > 10 {
+            println!("  ... and {} more records", projected_count - 10);
         }
+
+        if projection_verified {
+            println!("\nColumn pruning verification passed!");
+        } else {
+            eprintln!("\nColumn pruning verification failed!");
+            std::process::exit(1);
+        }
+
     }
 
-    if projected_count > 10 {
-        println!("  ... and {} more records", projected_count - 10);
-    }
 
-    if projection_verified {
-        println!("\nColumn pruning verification passed!");
-    } else {
-        eprintln!("\nColumn pruning verification failed!");
-        std::process::exit(1);
-    }
 
-    println!("\nRust example completed successfully!");
-    println!("This test read from EARLIEST_OFFSET which may trigger remote log reading if old data is in remote storage.");
-    Ok(())
 }
