@@ -544,6 +544,7 @@ fn parse_ipc_message(
     const CONTINUATION_MARKER: u32 = 0xFFFFFFFF;
 
     if data.len() < 8 {
+        eprintln!("[DEBUG parse_ipc] data.len()={} < 8, returning None", data.len());
         return None;
     }
 
@@ -551,10 +552,12 @@ fn parse_ipc_message(
     let metadata_size = LittleEndian::read_u32(&data[4..8]) as usize;
 
     if continuation != CONTINUATION_MARKER {
+        eprintln!("[DEBUG parse_ipc] continuation={:#x} != MARKER, returning None", continuation);
         return None;
     }
 
     if data.len() < 8 + metadata_size {
+        eprintln!("[DEBUG parse_ipc] data.len()={} < 8+metadata_size={}", data.len(), 8 + metadata_size);
         return None;
     }
 
@@ -562,10 +565,21 @@ fn parse_ipc_message(
     let message = root_as_message(metadata_bytes).ok()?;
     let batch_metadata = message.header_as_record_batch()?;
 
+    let body_length_from_msg = message.bodyLength();
     let metadata_padded_size = (metadata_size + 7) & !7;
     let body_start = 8 + metadata_padded_size;
     let body_data = &data[body_start..];
     let body_buffer = Buffer::from(body_data);
+
+    eprintln!("[DEBUG parse_ipc] data.len()={}, metadata_size={}, metadata_padded={}, body_start={}, body_buffer.len()={}, msg.bodyLength()={}",
+        data.len(), metadata_size, metadata_padded_size, body_start, body_buffer.len(), body_length_from_msg);
+
+    if let Some(buffers) = batch_metadata.buffers() {
+        eprintln!("[DEBUG parse_ipc] batch_metadata has {} buffers:", buffers.len());
+        for (i, buf) in buffers.iter().enumerate() {
+            eprintln!("[DEBUG parse_ipc]   buffer[{}]: offset={}, length={}", i, buf.offset(), buf.length());
+        }
+    }
 
     Some((batch_metadata, body_buffer, message.version()))
 }
@@ -721,13 +735,22 @@ impl ReadContext {
         let resolve_schema = match self.projection {
             Some(ref projection) => {
                 // projection, should use ordered schema by project field pos
+                eprintln!("[DEBUG record_batch] using projection ordered_schema, fields: {:?}",
+                    projection.ordered_schema.fields().iter().map(|f| (f.name(), f.data_type())).collect::<Vec<_>>());
+                eprintln!("[DEBUG record_batch] projected_fields={:?}, ordered_fields={:?}",
+                    projection.projected_fields, projection.ordered_fields);
                 projection.ordered_schema.clone()
             }
             None => {
                 // no projection, use target output schema
+                eprintln!("[DEBUG record_batch] no projection, using target_schema, fields: {:?}",
+                    self.target_schema.fields().iter().map(|f| (f.name(), f.data_type())).collect::<Vec<_>>());
                 self.target_schema.clone()
             }
         };
+
+        eprintln!("[DEBUG record_batch] calling read_record_batch with body_buffer.len()={}, schema_fields={}",
+            body_buffer.len(), resolve_schema.fields().len());
 
         let record_batch = read_record_batch(
             &body_buffer,
