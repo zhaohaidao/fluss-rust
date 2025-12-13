@@ -96,6 +96,10 @@ add_executable(fluss_cpp_example examples/example.cpp)
 target_link_libraries(fluss_cpp_example fluss_cpp)
 target_include_directories(fluss_cpp_example PUBLIC ${CPP_INCLUDE_DIR})
 
+add_executable(fluss_cpp_scan_from_ts examples/scan_from_ts.cpp)
+target_link_libraries(fluss_cpp_scan_from_ts fluss_cpp)
+target_include_directories(fluss_cpp_scan_from_ts PUBLIC ${CPP_INCLUDE_DIR})
+
 set_target_properties(fluss_cpp
     PROPERTIES ADDITIONAL_CLEAN_FILES ${CARGO_TARGET_DIR}
 )
