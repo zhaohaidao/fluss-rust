@@ -315,10 +315,10 @@ impl RemotePendingFetch {
         // delete the downloaded local file to free disk
         delete_file(file_path).await;
 
-        // Parse log records
+        // Parse log records (remote log contains full data, need client-side projection)
         let mut fetch_records = vec![];
         for log_record in &mut LogRecordsBatchs::new(data) {
-            fetch_records.extend(log_record.records(&self.read_context)?);
+            fetch_records.extend(log_record.records_for_remote_log(&self.read_context)?);
         }
 
         let mut result = HashMap::new();
