@@ -362,6 +362,16 @@ impl<'a> LogRecordsBatchs<'a> {
         }
     }
 
+    // pub fn next_batch_size(&self) -> Option<usize> {
+    //     if self.remaining_bytes < LOG_OVERHEAD {
+    //         return None;
+    //     }
+
+    //     let batch_size_bytes =
+    //         LittleEndian::read_i32(self.data.get(self.current_pos + LENGTH_OFFSET..).unwrap());
+    //     Some(batch_size_bytes as usize + LOG_OVERHEAD)
+    // }
+
     pub fn next_batch_size(&self) -> Option<usize> {
         if self.remaining_bytes < LOG_OVERHEAD {
             return None;
@@ -369,7 +379,11 @@ impl<'a> LogRecordsBatchs<'a> {
 
         let batch_size_bytes =
             LittleEndian::read_i32(self.data.get(self.current_pos + LENGTH_OFFSET..).unwrap());
-        Some(batch_size_bytes as usize + LOG_OVERHEAD)
+        let batch_size = batch_size_bytes as usize + LOG_OVERHEAD;
+        if batch_size > self.remaining_bytes {
+            return None;
+        }
+        Some(batch_size)
     }
 }
 
