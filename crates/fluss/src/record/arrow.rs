@@ -446,8 +446,18 @@ impl LogRecordBatch {
     }
 
     pub fn ensure_valid(&self) -> Result<()> {
-        // todo
-        Ok(())
+        if self.is_valid() {
+            return Ok(());
+        }
+        Err(Error::UnexpectedError {
+            message: format!(
+                "Record batch at offset {} is invalid (checksum={}, computed={}).",
+                self.base_log_offset(),
+                self.checksum(),
+                self.compute_checksum()
+            ),
+            source: None,
+        })
     }
 
     pub fn is_valid(&self) -> bool {
@@ -508,6 +518,10 @@ impl LogRecordBatch {
             return Ok(LogRecordIterator::empty());
         }
 
+        if !read_context.is_projection_pushdowned() {
+            self.ensure_valid()?;
+        }
+
         let data = &self.data[RECORDS_OFFSET..];
 
         let record_batch = read_context.record_batch(data)?;
@@ -526,6 +540,10 @@ impl LogRecordBatch {
     pub fn records_for_remote_log(&self, read_context: &ReadContext) -> Result<LogRecordIterator> {
         if self.record_count() == 0 {
             return Ok(LogRecordIterator::empty());
+        }
+
+        if !read_context.is_projection_pushdowned() {
+            self.ensure_valid()?;
         }
 
         let data = &self.data[RECORDS_OFFSET..];
@@ -857,6 +875,10 @@ impl ReadContext {
         self.projection
             .as_ref()
             .map(|p| p.ordered_fields.as_slice())
+    }
+
+    pub fn is_projection_pushdowned(&self) -> bool {
+        !self.is_from_remote && self.projection.is_some()
     }
 
     pub fn record_batch(&self, data: &[u8]) -> Result<RecordBatch> {

@@ -32,6 +32,7 @@ pub trait CompletedFetch: Send + Sync {
     fn table_bucket(&self) -> &TableBucket;
     fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>>;
     fn is_consumed(&self) -> bool;
+    fn records_read(&self) -> usize;
     fn drain(&mut self);
     fn size_in_bytes(&self) -> usize;
     fn high_watermark(&self) -> i64;
@@ -419,6 +420,10 @@ impl CompletedFetch for DefaultCompletedFetch {
 
     fn is_consumed(&self) -> bool {
         self.consumed
+    }
+
+    fn records_read(&self) -> usize {
+        self.records_read
     }
 
     fn drain(&mut self) {

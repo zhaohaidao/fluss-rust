@@ -828,6 +828,11 @@ impl LogFetcher {
                     .update_offset(&table_bucket, next_fetch_offset);
             }
 
+            if next_in_line_fetch.is_consumed() && next_in_line_fetch.records_read() > 0 {
+                self.log_scanner_status
+                    .move_bucket_to_end(table_bucket.clone());
+            }
+
             Ok(records)
         } else {
             // These records aren't next in line, ignore them

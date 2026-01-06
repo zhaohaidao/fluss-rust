@@ -62,6 +62,10 @@ impl InnerWriteBatch {
     fn drained(&mut self, now_ms: i64) {
         self.drained_ms = max(self.drained_ms, now_ms);
     }
+
+    fn table_path(&self) -> &TablePath {
+        &self.table_path
+    }
 }
 
 pub enum WriteBatch {
@@ -124,6 +128,10 @@ impl WriteBatch {
 
     pub fn batch_id(&self) -> i64 {
         self.inner_batch().batch_id
+    }
+
+    pub fn table_path(&self) -> &TablePath {
+        self.inner_batch().table_path()
     }
 }
 
