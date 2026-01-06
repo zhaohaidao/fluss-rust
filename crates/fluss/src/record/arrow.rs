@@ -467,8 +467,7 @@ impl LogRecordBatch {
 
     fn compute_checksum(&self) -> u32 {
         let start = SCHEMA_ID_OFFSET;
-        let end = start + self.data.len();
-        crc32c(&self.data[start..end])
+        crc32c(&self.data[start..])
     }
 
     fn attributes(&self) -> u8 {
@@ -481,12 +480,12 @@ impl LogRecordBatch {
 
     pub fn checksum(&self) -> u32 {
         let offset = CRC_OFFSET;
-        LittleEndian::read_u32(&self.data[offset..offset + CRC_OFFSET])
+        LittleEndian::read_u32(&self.data[offset..offset + CRC_LENGTH])
     }
 
     pub fn schema_id(&self) -> i16 {
         let offset = SCHEMA_ID_OFFSET;
-        LittleEndian::read_i16(&self.data[offset..offset + SCHEMA_ID_OFFSET])
+        LittleEndian::read_i16(&self.data[offset..offset + SCHEMA_ID_LENGTH])
     }
 
     pub fn base_log_offset(&self) -> i64 {

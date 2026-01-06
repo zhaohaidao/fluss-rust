@@ -417,7 +417,245 @@ impl Sender {
         )
     }
 
-    pub async fn close(&mut self) {
-        self.running = false;
+pub async fn close(&mut self) {
+    self.running = false;
+}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::WriteRecord;
+    use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
+    use crate::config::Config;
+    use crate::metadata::{DataField, DataTypes, Schema, TableDescriptor, TableInfo, TablePath};
+    use crate::row::{Datum, GenericRow};
+    use crate::rpc::FlussError;
+    use crate::proto::{PbProduceLogRespForBucket, ProduceLogResponse};
+    use std::collections::HashSet;
+
+    fn build_table_info(table_path: TablePath, table_id: i64) -> TableInfo {
+        let row_type = DataTypes::row(vec![DataField::new(
+            "id".to_string(),
+            DataTypes::int(),
+            None,
+        )]);
+        let mut schema_builder = Schema::builder().with_row_type(&row_type);
+        let schema = schema_builder.build().expect("schema build");
+        let table_descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(1), vec![])
+            .build()
+            .expect("descriptor build");
+        TableInfo::of(table_path, table_id, 1, table_descriptor, 0, 0)
+    }
+
+    fn build_cluster(table_path: &TablePath, table_id: i64) -> Arc<Cluster> {
+        let server = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let table_bucket = TableBucket::new(table_id, 0);
+        let bucket_location =
+            BucketLocation::new(table_bucket.clone(), Some(server.clone()), table_path.clone());
+
+        let mut servers = HashMap::new();
+        servers.insert(server.id(), server);
+
+        let mut locations_by_path = HashMap::new();
+        locations_by_path.insert(table_path.clone(), vec![bucket_location.clone()]);
+
+        let mut locations_by_bucket = HashMap::new();
+        locations_by_bucket.insert(table_bucket, bucket_location);
+
+        let mut table_id_by_path = HashMap::new();
+        table_id_by_path.insert(table_path.clone(), table_id);
+
+        let mut table_info_by_path = HashMap::new();
+        table_info_by_path.insert(
+            table_path.clone(),
+            build_table_info(table_path.clone(), table_id),
+        );
+
+        Arc::new(Cluster::new(
+            None,
+            servers,
+            locations_by_path,
+            locations_by_bucket,
+            table_id_by_path,
+            table_info_by_path,
+        ))
+    }
+
+    async fn build_ready_batch(
+        accumulator: &RecordAccumulator,
+        cluster: Arc<Cluster>,
+        table_path: Arc<TablePath>,
+    ) -> Result<(ReadyWriteBatch, crate::client::ResultHandle)> {
+        let record = WriteRecord::new(
+            table_path,
+            GenericRow {
+                values: vec![Datum::Int32(1)],
+            },
+        );
+        let result = accumulator.append(&record, 0, &cluster, false).await?;
+        let result_handle = result.result_handle.expect("result handle");
+        let server = cluster.get_tablet_server(1).expect("server");
+        let nodes = HashSet::from([server.clone()]);
+        let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024).await?;
+        let mut drained = batches.remove(&1).expect("drained batches");
+        let batch = drained.pop().expect("batch");
+        Ok((batch, result_handle))
+    }
+
+    #[tokio::test]
+    async fn handle_write_batch_error_retries() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster(table_path.as_ref(), 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let accumulator = Arc::new(RecordAccumulator::new(Config::default()));
+        let sender = Sender::new(
+            metadata,
+            accumulator.clone(),
+            1024 * 1024,
+            1000,
+            1,
+            1,
+        );
+
+        let (batch, _handle) =
+            build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path.clone()).await?;
+        let mut inflight = HashMap::new();
+        inflight.insert(1, vec![batch]);
+        sender.add_to_inflight_batches(&inflight);
+        let batch = inflight.remove(&1).unwrap().pop().unwrap();
+
+        sender
+            .handle_write_batch_error(
+                batch,
+                FlussError::RequestTimeOut,
+                "timeout".to_string(),
+            )
+            .await?;
+
+        let server = cluster.get_tablet_server(1).expect("server");
+        let nodes = HashSet::from([server.clone()]);
+        let mut batches = accumulator.drain(cluster, &nodes, 1024 * 1024).await?;
+        let mut drained = batches.remove(&1).expect("drained batches");
+        let batch = drained.pop().expect("batch");
+        assert_eq!(batch.write_batch.attempts(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_write_batch_error_fails() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster(table_path.as_ref(), 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let accumulator = Arc::new(RecordAccumulator::new(Config::default()));
+        let sender = Sender::new(
+            metadata,
+            accumulator.clone(),
+            1024 * 1024,
+            1000,
+            1,
+            0,
+        );
+
+        let (batch, handle) =
+            build_ready_batch(accumulator.as_ref(), cluster.clone(), table_path).await?;
+        sender
+            .handle_write_batch_error(
+                batch,
+                FlussError::InvalidTableException,
+                "invalid".to_string(),
+            )
+            .await?;
+
+        let batch_result = handle.wait().await?;
+        assert!(matches!(
+            batch_result,
+            Err(broadcast::Error::WriteFailed { code, .. })
+                if code == FlussError::InvalidTableException.code()
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_produce_response_missing_bucket_fails() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster(table_path.as_ref(), 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let accumulator = Arc::new(RecordAccumulator::new(Config::default()));
+        let sender = Sender::new(
+            metadata,
+            accumulator.clone(),
+            1024 * 1024,
+            1000,
+            1,
+            0,
+        );
+
+        let (batch, handle) =
+            build_ready_batch(accumulator.as_ref(), cluster, table_path).await?;
+        let request_buckets = vec![batch.table_bucket.clone()];
+        let mut records_by_bucket = HashMap::new();
+        records_by_bucket.insert(batch.table_bucket.clone(), batch);
+
+        let response = ProduceLogResponse {
+            buckets_resp: vec![PbProduceLogRespForBucket {
+                bucket_id: 1,
+                error_code: None,
+                ..Default::default()
+            }],
+        };
+
+        sender
+            .handle_produce_response(1, &request_buckets, &mut records_by_bucket, response)
+            .await?;
+
+        let batch_result = handle.wait().await?;
+        assert!(matches!(
+            batch_result,
+            Err(broadcast::Error::WriteFailed { code, .. })
+                if code == FlussError::UnknownServerError.code()
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_produce_response_duplicate_sequence_completes() -> Result<()> {
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let cluster = build_cluster(table_path.as_ref(), 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let accumulator = Arc::new(RecordAccumulator::new(Config::default()));
+        let sender = Sender::new(
+            metadata,
+            accumulator.clone(),
+            1024 * 1024,
+            1000,
+            1,
+            0,
+        );
+
+        let (batch, handle) =
+            build_ready_batch(accumulator.as_ref(), cluster, table_path).await?;
+        let request_buckets = vec![batch.table_bucket.clone()];
+        let mut records_by_bucket = HashMap::new();
+        records_by_bucket.insert(batch.table_bucket.clone(), batch);
+
+        let response = ProduceLogResponse {
+            buckets_resp: vec![PbProduceLogRespForBucket {
+                bucket_id: 0,
+                error_code: Some(FlussError::DuplicateSequenceException.code()),
+                error_message: Some("dup".to_string()),
+                ..Default::default()
+            }],
+        };
+
+        sender
+            .handle_produce_response(1, &request_buckets, &mut records_by_bucket, response)
+            .await?;
+
+        let batch_result = handle.wait().await?;
+        assert!(matches!(batch_result, Ok(())));
+        Ok(())
     }
 }

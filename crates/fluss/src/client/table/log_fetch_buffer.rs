@@ -458,7 +458,7 @@ impl CompletedFetch for DefaultCompletedFetch {
 mod tests {
     use super::*;
     use crate::client::WriteRecord;
-    use crate::compression::arrow_compression::{
+    use crate::compression::{
         ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
     };
     use crate::metadata::{DataField, DataTypes, TablePath};
