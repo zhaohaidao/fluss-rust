@@ -24,6 +24,7 @@ use crate::client::table::log_fetch_buffer::{
 use crate::client::table::remote_log::{
     RemoteLogDownloader, RemoteLogFetchInfo, RemotePendingFetch,
 };
+use crate::config::Config;
 use crate::error::{ApiError, Error, FlussError, Result, RpcError};
 use crate::metadata::{TableBucket, TableInfo, TablePath};
 use crate::proto::{FetchLogRequest, PbFetchLogReqForBucket, PbFetchLogReqForTable};
@@ -39,11 +40,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
-const LOG_FETCH_MAX_BYTES: i32 = 16 * 1024 * 1024;
-#[allow(dead_code)]
-const LOG_FETCH_MAX_BYTES_FOR_BUCKET: i32 = 1024;
-const LOG_FETCH_MIN_BYTES: i32 = 1;
-const LOG_FETCH_WAIT_MAX_TIME: i32 = 500;
 
 pub struct TableScan<'a> {
     conn: &'a FlussConnection,
@@ -137,7 +133,15 @@ impl<'a> TableScan<'a> {
                 .iter()
                 .position(|f| f.name() == *name)
                 .ok_or_else(|| Error::IllegalArgument {
-                    message: format!("Column '{name}' not found"),
+                    message: format!(
+                        "Field '{name}' not found in table schema. Available fields: {:?}, Table: {}",
+                        row_type
+                            .fields()
+                            .iter()
+                            .map(|field| field.name())
+                            .collect::<Vec<_>>(),
+                        self.table_info.table_path
+                    ),
                 })?;
             indices.push(idx);
         }
@@ -151,6 +155,7 @@ impl<'a> TableScan<'a> {
             &self.table_info,
             self.metadata.clone(),
             self.conn.get_connections(),
+            self.conn.config().clone(),
             self.projected_fields,
         )
     }
@@ -162,6 +167,7 @@ pub struct LogScanner {
     metadata: Arc<Metadata>,
     log_scanner_status: Arc<LogScannerStatus>,
     log_fetcher: LogFetcher,
+    thread_access: Mutex<ThreadAccess>,
 }
 
 impl LogScanner {
@@ -169,6 +175,7 @@ impl LogScanner {
         table_info: &TableInfo,
         metadata: Arc<Metadata>,
         connections: Arc<RpcClient>,
+        config: Config,
         projected_fields: Option<Vec<usize>>,
     ) -> Result<Self> {
         let log_scanner_status = Arc::new(LogScannerStatus::new());
@@ -182,12 +189,20 @@ impl LogScanner {
                 connections.clone(),
                 metadata.clone(),
                 log_scanner_status.clone(),
+                config,
                 projected_fields,
             )?,
+            thread_access: Mutex::new(ThreadAccess::default()),
         })
     }
 
     pub async fn poll(&self, timeout: Duration) -> Result<ScanRecords> {
+        let _guard = self.acquire()?;
+        if !self.log_scanner_status.prepare_to_poll() {
+            return Err(Error::IllegalArgument {
+                message: "LogScanner is not subscribed any buckets.".to_string(),
+            });
+        }
         let start = std::time::Instant::now();
         let deadline = start + timeout;
 
@@ -211,11 +226,18 @@ impl LogScanner {
 
             // Wait for buffer to become non-empty with remaining time
             let remaining = deadline - now;
-            let has_data = self
+            let has_data = match self
                 .log_fetcher
                 .log_fetch_buffer
                 .await_not_empty(remaining)
-                .await?;
+                .await
+            {
+                Ok(has_data) => has_data,
+                Err(Error::WakeupError { .. }) => {
+                    return Ok(ScanRecords::new(HashMap::new()))
+                }
+                Err(e) => return Err(e),
+            };
 
             if !has_data {
                 // Timeout while waiting
@@ -227,6 +249,7 @@ impl LogScanner {
     }
 
     pub async fn subscribe(&self, bucket: i32, offset: i64) -> Result<()> {
+        let _guard = self.acquire()?;
         let table_bucket = TableBucket::new(self.table_id, bucket);
         self.metadata
             .check_and_update_table_metadata(from_ref(&self.table_path))
@@ -237,6 +260,7 @@ impl LogScanner {
     }
 
     pub async fn subscribe_batch(&self, bucket_offsets: &HashMap<i32, i64>) -> Result<()> {
+        let _guard = self.acquire()?;
         self.metadata
             .check_and_update_table_metadata(from_ref(&self.table_path))
             .await?;
@@ -270,6 +294,54 @@ impl LogScanner {
         // Collect completed fetches from buffer
         self.log_fetcher.collect_fetches()
     }
+
+    pub fn wakeup(&self) {
+        self.log_fetcher.log_fetch_buffer.wakeup();
+    }
+
+    fn acquire(&self) -> Result<ThreadGuard<'_>> {
+        let thread_id = std::thread::current().id();
+        let mut access = self.thread_access.lock();
+        match access.thread_id {
+            None => {
+                access.thread_id = Some(thread_id);
+                access.ref_count = 1;
+            }
+            Some(current) if current == thread_id => {
+                access.ref_count = access.ref_count.saturating_add(1);
+            }
+            Some(_) => {
+                return Err(Error::IllegalArgument {
+                    message: "LogScanner is not thread-safe.".to_string(),
+                });
+            }
+        }
+        Ok(ThreadGuard { scanner: self })
+    }
+
+    fn release(&self) {
+        let mut access = self.thread_access.lock();
+        access.ref_count = access.ref_count.saturating_sub(1);
+        if access.ref_count == 0 {
+            access.thread_id = None;
+        }
+    }
+}
+
+#[derive(Default)]
+struct ThreadAccess {
+    thread_id: Option<std::thread::ThreadId>,
+    ref_count: usize,
+}
+
+struct ThreadGuard<'a> {
+    scanner: &'a LogScanner,
+}
+
+impl Drop for ThreadGuard<'_> {
+    fn drop(&mut self) {
+        self.scanner.release();
+    }
 }
 
 struct LogFetcher {
@@ -286,6 +358,11 @@ struct LogFetcher {
     nodes_with_pending_fetch_requests: Arc<Mutex<HashSet<i32>>>,
     table_path: TablePath,
     is_partitioned: bool,
+    max_fetch_bytes: i32,
+    max_bucket_fetch_bytes: i32,
+    min_fetch_bytes: i32,
+    max_fetch_wait_ms: i32,
+    max_poll_records: usize,
 }
 
 impl LogFetcher {
@@ -294,6 +371,7 @@ impl LogFetcher {
         conns: Arc<RpcClient>,
         metadata: Arc<Metadata>,
         log_scanner_status: Arc<LogScannerStatus>,
+        config: Config,
         projected_fields: Option<Vec<usize>>,
     ) -> Result<Self> {
         let full_arrow_schema = to_arrow_schema(table_info.get_row_type());
@@ -319,6 +397,11 @@ impl LogFetcher {
             nodes_with_pending_fetch_requests: Arc::new(Mutex::new(HashSet::new())),
             table_path: table_info.table_path.clone(),
             is_partitioned: table_info.is_partitioned(),
+            max_fetch_bytes: config.scanner_log_fetch_max_bytes,
+            max_bucket_fetch_bytes: config.scanner_log_fetch_max_bytes_for_bucket,
+            min_fetch_bytes: config.scanner_log_fetch_min_bytes,
+            max_fetch_wait_ms: config.scanner_log_fetch_wait_max_ms,
+            max_poll_records: config.scanner_log_max_poll_records,
         })
     }
 
@@ -692,9 +775,8 @@ impl LogFetcher {
     /// Collect completed fetches from buffer
     /// Reference: LogFetchCollector.collectFetch in Java
     fn collect_fetches(&self) -> Result<HashMap<TableBucket, Vec<ScanRecord>>> {
-        const MAX_POLL_RECORDS: usize = 500; // Default max poll records
         let mut result: HashMap<TableBucket, Vec<ScanRecord>> = HashMap::new();
-        let mut records_remaining = MAX_POLL_RECORDS;
+        let mut records_remaining = self.max_poll_records;
         let mut pending_error = self.log_fetch_buffer.take_error();
 
         while records_remaining > 0 {
@@ -903,13 +985,12 @@ impl LogFetcher {
                             "Skipping fetch request for bucket {bucket} because previous request to server {leader} has not been processed."
                         )
                     } else {
-                        let fetch_log_req_for_bucket = PbFetchLogReqForBucket {
-                            partition_id: None,
-                            bucket_id: bucket.bucket_id(),
-                            fetch_offset: offset,
-                            // 1M
-                            max_fetch_bytes: 1024 * 1024,
-                        };
+                    let fetch_log_req_for_bucket = PbFetchLogReqForBucket {
+                        partition_id: None,
+                        bucket_id: bucket.bucket_id(),
+                        fetch_offset: offset,
+                        max_fetch_bytes: self.max_bucket_fetch_bytes,
+                    };
 
                         fetch_log_req_for_buckets
                             .entry(leader)
@@ -942,10 +1023,10 @@ impl LogFetcher {
 
                     let fetch_log_request = FetchLogRequest {
                         follower_server_id: -1,
-                        max_bytes: LOG_FETCH_MAX_BYTES,
+                        max_bytes: self.max_fetch_bytes,
                         tables_req: vec![req_for_table],
-                        max_wait_ms: Some(LOG_FETCH_WAIT_MAX_TIME),
-                        min_bytes: Some(LOG_FETCH_MIN_BYTES),
+                        max_wait_ms: Some(self.max_fetch_wait_ms),
+                        min_bytes: Some(self.min_fetch_bytes),
                     };
                     (leader_id, fetch_log_request)
                 })
@@ -1102,10 +1183,13 @@ mod tests {
     use crate::compression::{
         ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
     };
+    use crate::config::Config;
     use crate::metadata::{DataField, DataTypes, Schema, TableDescriptor, TableInfo, TablePath};
     use crate::record::MemoryLogRecordsArrowBuilder;
     use crate::row::{Datum, GenericRow};
     use crate::rpc::FlussError;
+    use std::time::Duration;
+    use std::thread;
 
     fn build_table_info(table_path: TablePath, table_id: i64) -> TableInfo {
         let row_type = DataTypes::row(vec![DataField::new(
@@ -1189,6 +1273,7 @@ mod tests {
             Arc::new(RpcClient::new()),
             metadata,
             status.clone(),
+            Config::default(),
             None,
         )?;
 
@@ -1226,6 +1311,7 @@ mod tests {
             Arc::new(RpcClient::new()),
             metadata,
             status,
+            Config::default(),
             None,
         )?;
 
@@ -1261,6 +1347,7 @@ mod tests {
             Arc::new(RpcClient::new()),
             metadata,
             status,
+            Config::default(),
             None,
         )?;
 
@@ -1287,6 +1374,7 @@ mod tests {
             Arc::new(RpcClient::new()),
             metadata.clone(),
             status.clone(),
+            Config::default(),
             None,
         )?;
 
@@ -1318,6 +1406,73 @@ mod tests {
 
         let error = fetcher.log_fetch_buffer.take_error().expect("error");
         assert!(matches!(error, Error::FlussAPIError { .. }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_without_subscription_returns_error() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = build_table_info(table_path.clone(), 1);
+        let cluster = build_cluster(&table_path, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster));
+        let scanner = LogScanner::new(
+            &table_info,
+            metadata,
+            Arc::new(RpcClient::new()),
+            Config::default(),
+            None,
+        )?;
+
+        let result = scanner.poll(Duration::from_millis(1)).await;
+        assert!(matches!(result, Err(Error::IllegalArgument { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_wakeup_returns_empty() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = build_table_info(table_path.clone(), 1);
+        let cluster = build_cluster(&table_path, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster));
+        let scanner = LogScanner::new(
+            &table_info,
+            metadata,
+            Arc::new(RpcClient::new()),
+            Config::default(),
+            None,
+        )?;
+
+        scanner
+            .log_scanner_status
+            .assign_scan_bucket(TableBucket::new(1, 0), 0);
+        scanner.wakeup();
+
+        let result = scanner.poll(Duration::from_millis(5)).await?;
+        assert!(result.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn log_scanner_rejects_concurrent_access() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = build_table_info(table_path.clone(), 1);
+        let cluster = build_cluster(&table_path, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster));
+        let scanner = Arc::new(LogScanner::new(
+            &table_info,
+            metadata,
+            Arc::new(RpcClient::new()),
+            Config::default(),
+            None,
+        )?);
+
+        let guard = scanner.acquire()?;
+        let scanner_clone = scanner.clone();
+        let handle = thread::spawn(move || scanner_clone.acquire().is_err());
+        let denied = handle.join().expect("thread join");
+        drop(guard);
+
+        assert!(denied);
         Ok(())
     }
 }

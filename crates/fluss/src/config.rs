@@ -36,6 +36,21 @@ pub struct Config {
 
     #[arg(long, default_value_t = 2 * 1024 * 1024)]
     pub writer_batch_size: i32,
+
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    pub scanner_log_fetch_max_bytes: i32,
+
+    #[arg(long, default_value_t = 1024 * 1024)]
+    pub scanner_log_fetch_max_bytes_for_bucket: i32,
+
+    #[arg(long, default_value_t = 1)]
+    pub scanner_log_fetch_min_bytes: i32,
+
+    #[arg(long, default_value_t = 500)]
+    pub scanner_log_fetch_wait_max_ms: i32,
+
+    #[arg(long, default_value_t = 500)]
+    pub scanner_log_max_poll_records: usize,
 }
 
 impl Default for Config {
@@ -46,6 +61,11 @@ impl Default for Config {
             writer_acks: String::from("all"),
             writer_retries: i32::MAX,
             writer_batch_size: 2 * 1024 * 1024,
+            scanner_log_fetch_max_bytes: 16 * 1024 * 1024,
+            scanner_log_fetch_max_bytes_for_bucket: 1024 * 1024,
+            scanner_log_fetch_min_bytes: 1,
+            scanner_log_fetch_wait_max_ms: 500,
+            scanner_log_max_poll_records: 500,
         }
     }
 }
