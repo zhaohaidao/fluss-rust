@@ -325,19 +325,30 @@ impl LogFetcher {
     }
 
     async fn check_and_update_metadata(&self) -> Result<()> {
-        if self.is_partitioned {
-            // TODO: Implement partition-aware metadata refresh for buckets whose leaders are unknown.
-            // The implementation will likely need to collect partition IDs for such buckets and
-            // perform targeted metadata updates. Until then, we avoid computing unused partition_ids.
-            return Ok(());
-        }
-
         let need_update = self
             .fetchable_buckets()
             .iter()
             .any(|bucket| self.get_table_bucket_leader(bucket).is_none());
 
         if !need_update {
+            return Ok(());
+        }
+
+        if self.is_partitioned {
+            // Fallback to full table metadata refresh until partition-aware updates are available.
+            self.metadata
+                .update_tables_metadata(&HashSet::from([&self.table_path]))
+                .await
+                .or_else(|e| {
+                    if let Error::RpcError { source, .. } = &e
+                        && matches!(source, RpcError::ConnectionError(_) | RpcError::Poisoned(_))
+                    {
+                        warn!("Retrying after encountering error while updating table metadata: {e}");
+                        Ok(())
+                    } else {
+                        Err(e)
+                    }
+                })?;
             return Ok(());
         }
 

@@ -135,7 +135,8 @@ impl Metadata {
         guard.clone()
     }
 
-    pub fn leader_for(&self, _table_bucket: &TableBucket) -> Option<&ServerNode> {
-        todo!()
+    pub fn leader_for(&self, table_bucket: &TableBucket) -> Option<ServerNode> {
+        let cluster = self.cluster.read();
+        cluster.leader_for(table_bucket).cloned()
     }
 }
