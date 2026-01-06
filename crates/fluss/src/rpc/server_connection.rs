@@ -39,6 +39,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot::{Sender, channel};
 use tokio::task::JoinHandle;
 
+#[cfg(test)]
+use bytes::Buf;
+
 pub type MessengerTransport = ServerConnectionInner<BufStream<Transport>>;
 
 pub type ServerConnection = Arc<MessengerTransport>;
@@ -105,6 +108,54 @@ impl RpcClient {
         );
         Ok(ServerConnection::new(messenger))
     }
+
+    #[cfg(test)]
+    pub(crate) fn insert_connection_for_test(
+        &self,
+        server_node: &ServerNode,
+        connection: ServerConnection,
+    ) {
+        self.connections
+            .write()
+            .insert(server_node.uid().clone(), connection);
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn spawn_mock_server<F>(
+    mut server: tokio::io::DuplexStream,
+    mut handler: F,
+) -> JoinHandle<()>
+where
+    F: FnMut(crate::rpc::api_key::ApiKey, i32, Vec<u8>) -> Vec<u8> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let msg = match server.read_message(usize::MAX).await {
+                Ok(msg) => msg,
+                Err(_) => break,
+            };
+            let mut cursor = Cursor::new(msg);
+            let api_key = crate::rpc::api_key::ApiKey::from(cursor.get_i16());
+            let _api_version = cursor.get_i16();
+            let request_id = cursor.get_i32();
+            let remaining = {
+                let pos = cursor.position() as usize;
+                cursor.into_inner()[pos..].to_vec()
+            };
+
+            let body = handler(api_key, request_id, remaining);
+
+            let mut response = Vec::new();
+            response.push(0);
+            response.extend_from_slice(&request_id.to_be_bytes());
+            response.extend_from_slice(&body);
+
+            if server.write_message(&response).await.is_err() {
+                break;
+            }
+        }
+    })
 }
 
 #[derive(Debug)]

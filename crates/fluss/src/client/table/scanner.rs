@@ -37,6 +37,8 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::slice::from_ref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::ThreadId;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -68,11 +70,11 @@ impl<'a> TableScan<'a> {
     /// Returns an error if `column_indices` is empty or if any column index is out of range.
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// # use fluss::client::FlussTable;
     /// # use fluss::error::Result;
-    /// # fn example(table: &FlussTable<'_>) -> Result<()> {
-    /// let _scanner = table.new_scan().project(&[0, 2, 3])?.create_log_scanner()?;
+    /// # fn example(table: FlussTable<'_>) -> Result<()> {
+    /// let scanner = table.new_scan().project(&[0, 2, 3])?.create_log_scanner();
     /// # Ok(())
     /// # }
     /// ```
@@ -107,14 +109,11 @@ impl<'a> TableScan<'a> {
     /// Returns an error if `column_names` is empty or if any column name is not found in the table schema.
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// # use fluss::client::FlussTable;
     /// # use fluss::error::Result;
-    /// # fn example(table: &FlussTable<'_>) -> Result<()> {
-    /// let _scanner = table
-    ///     .new_scan()
-    ///     .project_by_name(&["col1", "col3"])?
-    ///     .create_log_scanner()?;
+    /// # fn example(table: FlussTable<'_>) -> Result<()> {
+    /// let scanner = table.new_scan().project_by_name(&["col1", "col3"])?.create_log_scanner();
     /// # Ok(())
     /// # }
     /// ```
@@ -133,15 +132,7 @@ impl<'a> TableScan<'a> {
                 .iter()
                 .position(|f| f.name() == *name)
                 .ok_or_else(|| Error::IllegalArgument {
-                    message: format!(
-                        "Field '{name}' not found in table schema. Available fields: {:?}, Table: {}",
-                        row_type
-                            .fields()
-                            .iter()
-                            .map(|field| field.name())
-                            .collect::<Vec<_>>(),
-                        self.table_info.table_path
-                    ),
+                    message: format!("Column '{name}' not found"),
                 })?;
             indices.push(idx);
         }
@@ -155,7 +146,7 @@ impl<'a> TableScan<'a> {
             &self.table_info,
             self.metadata.clone(),
             self.conn.get_connections(),
-            self.conn.config().clone(),
+            self.conn.config(),
             self.projected_fields,
         )
     }
@@ -167,7 +158,7 @@ pub struct LogScanner {
     metadata: Arc<Metadata>,
     log_scanner_status: Arc<LogScannerStatus>,
     log_fetcher: LogFetcher,
-    thread_access: Mutex<ThreadAccess>,
+    thread_access: Arc<ThreadAccess>,
 }
 
 impl LogScanner {
@@ -175,10 +166,11 @@ impl LogScanner {
         table_info: &TableInfo,
         metadata: Arc<Metadata>,
         connections: Arc<RpcClient>,
-        config: Config,
+        config: &Config,
         projected_fields: Option<Vec<usize>>,
     ) -> Result<Self> {
         let log_scanner_status = Arc::new(LogScannerStatus::new());
+        let thread_access = Arc::new(ThreadAccess::default());
         Ok(Self {
             table_path: table_info.table_path.clone(),
             table_id: table_info.table_id,
@@ -192,21 +184,23 @@ impl LogScanner {
                 config,
                 projected_fields,
             )?,
-            thread_access: Mutex::new(ThreadAccess::default()),
+            thread_access,
         })
     }
 
     pub async fn poll(&self, timeout: Duration) -> Result<ScanRecords> {
-        let _guard = self.acquire()?;
+        let _guard = self.thread_access.acquire()?;
+        self.thread_access.check_wakeup()?;
+
         if !self.log_scanner_status.prepare_to_poll() {
-            return Err(Error::IllegalArgument {
-                message: "LogScanner is not subscribed any buckets.".to_string(),
-            });
+            return Ok(ScanRecords::new(HashMap::new()));
         }
+
         let start = std::time::Instant::now();
         let deadline = start + timeout;
 
         loop {
+            self.thread_access.check_wakeup()?;
             // Try to collect fetches
             let fetch_result = self.poll_for_fetches().await?;
 
@@ -226,18 +220,11 @@ impl LogScanner {
 
             // Wait for buffer to become non-empty with remaining time
             let remaining = deadline - now;
-            let has_data = match self
+            let has_data = self
                 .log_fetcher
                 .log_fetch_buffer
                 .await_not_empty(remaining)
-                .await
-            {
-                Ok(has_data) => has_data,
-                Err(Error::WakeupError { .. }) => {
-                    return Ok(ScanRecords::new(HashMap::new()))
-                }
-                Err(e) => return Err(e),
-            };
+                .await?;
 
             if !has_data {
                 // Timeout while waiting
@@ -249,7 +236,9 @@ impl LogScanner {
     }
 
     pub async fn subscribe(&self, bucket: i32, offset: i64) -> Result<()> {
-        let _guard = self.acquire()?;
+        let _guard = self.thread_access.acquire()?;
+        self.thread_access.check_wakeup()?;
+
         let table_bucket = TableBucket::new(self.table_id, bucket);
         self.metadata
             .check_and_update_table_metadata(from_ref(&self.table_path))
@@ -260,7 +249,9 @@ impl LogScanner {
     }
 
     pub async fn subscribe_batch(&self, bucket_offsets: &HashMap<i32, i64>) -> Result<()> {
-        let _guard = self.acquire()?;
+        let _guard = self.thread_access.acquire()?;
+        self.thread_access.check_wakeup()?;
+
         self.metadata
             .check_and_update_table_metadata(from_ref(&self.table_path))
             .await?;
@@ -282,6 +273,11 @@ impl LogScanner {
         Ok(())
     }
 
+    pub fn wakeup(&self) {
+        self.thread_access.wakeup();
+        self.log_fetcher.log_fetch_buffer.wakeup();
+    }
+
     async fn poll_for_fetches(&self) -> Result<HashMap<TableBucket, Vec<ScanRecord>>> {
         let result = self.log_fetcher.collect_fetches()?;
         if !result.is_empty() {
@@ -294,53 +290,72 @@ impl LogScanner {
         // Collect completed fetches from buffer
         self.log_fetcher.collect_fetches()
     }
-
-    pub fn wakeup(&self) {
-        self.log_fetcher.log_fetch_buffer.wakeup();
-    }
-
-    fn acquire(&self) -> Result<ThreadGuard<'_>> {
-        let thread_id = std::thread::current().id();
-        let mut access = self.thread_access.lock();
-        match access.thread_id {
-            None => {
-                access.thread_id = Some(thread_id);
-                access.ref_count = 1;
-            }
-            Some(current) if current == thread_id => {
-                access.ref_count = access.ref_count.saturating_add(1);
-            }
-            Some(_) => {
-                return Err(Error::IllegalArgument {
-                    message: "LogScanner is not thread-safe.".to_string(),
-                });
-            }
-        }
-        Ok(ThreadGuard { scanner: self })
-    }
-
-    fn release(&self) {
-        let mut access = self.thread_access.lock();
-        access.ref_count = access.ref_count.saturating_sub(1);
-        if access.ref_count == 0 {
-            access.thread_id = None;
-        }
-    }
 }
 
 #[derive(Default)]
 struct ThreadAccess {
-    thread_id: Option<std::thread::ThreadId>,
-    ref_count: usize,
+    owner: Mutex<Option<ThreadId>>,
+    ref_count: AtomicUsize,
+    wakeup: AtomicBool,
+}
+
+impl ThreadAccess {
+    fn acquire(&self) -> Result<ThreadGuard<'_>> {
+        let current = std::thread::current().id();
+        {
+            let mut guard = self.owner.lock();
+            match *guard {
+                None => {
+                    *guard = Some(current);
+                }
+                Some(owner) => {
+                    if owner != current {
+                        return Err(Error::UnexpectedError {
+                            message: "LogScanner is accessed from different threads.".to_string(),
+                            source: None,
+                        });
+                    }
+                }
+            }
+        }
+        self.ref_count.fetch_add(1, Ordering::Acquire);
+        Ok(ThreadGuard {
+            access: self,
+            thread_id: current,
+        })
+    }
+
+    fn release(&self, thread_id: ThreadId) {
+        if self.ref_count.fetch_sub(1, Ordering::Release) == 1 {
+            let mut guard = self.owner.lock();
+            if guard.map(|owner| owner == thread_id).unwrap_or(false) {
+                *guard = None;
+            }
+        }
+    }
+
+    fn wakeup(&self) {
+        self.wakeup.store(true, Ordering::Release);
+    }
+
+    fn check_wakeup(&self) -> Result<()> {
+        if self.wakeup.swap(false, Ordering::AcqRel) {
+            return Err(Error::WakeupError {
+                message: "LogScanner wakeup.".to_string(),
+            });
+        }
+        Ok(())
+    }
 }
 
 struct ThreadGuard<'a> {
-    scanner: &'a LogScanner,
+    access: &'a ThreadAccess,
+    thread_id: ThreadId,
 }
 
 impl Drop for ThreadGuard<'_> {
     fn drop(&mut self) {
-        self.scanner.release();
+        self.access.release(self.thread_id);
     }
 }
 
@@ -357,7 +372,6 @@ struct LogFetcher {
     log_fetch_buffer: Arc<LogFetchBuffer>,
     nodes_with_pending_fetch_requests: Arc<Mutex<HashSet<i32>>>,
     table_path: TablePath,
-    is_partitioned: bool,
     max_fetch_bytes: i32,
     max_bucket_fetch_bytes: i32,
     min_fetch_bytes: i32,
@@ -371,7 +385,7 @@ impl LogFetcher {
         conns: Arc<RpcClient>,
         metadata: Arc<Metadata>,
         log_scanner_status: Arc<LogScannerStatus>,
-        config: Config,
+        config: &Config,
         projected_fields: Option<Vec<usize>>,
     ) -> Result<Self> {
         let full_arrow_schema = to_arrow_schema(table_info.get_row_type());
@@ -396,7 +410,6 @@ impl LogFetcher {
             log_fetch_buffer: Arc::new(LogFetchBuffer::new()),
             nodes_with_pending_fetch_requests: Arc::new(Mutex::new(HashSet::new())),
             table_path: table_info.table_path.clone(),
-            is_partitioned: table_info.is_partitioned(),
             max_fetch_bytes: config.scanner_log_fetch_max_bytes,
             max_bucket_fetch_bytes: config.scanner_log_fetch_max_bytes_for_bucket,
             min_fetch_bytes: config.scanner_log_fetch_min_bytes,
@@ -427,24 +440,6 @@ impl LogFetcher {
             .any(|bucket| self.get_table_bucket_leader(bucket).is_none());
 
         if !need_update {
-            return Ok(());
-        }
-
-        if self.is_partitioned {
-            // Fallback to full table metadata refresh until partition-aware updates are available.
-            self.metadata
-                .update_tables_metadata(&HashSet::from([&self.table_path]))
-                .await
-                .or_else(|e| {
-                    if let Error::RpcError { source, .. } = &e
-                        && matches!(source, RpcError::ConnectionError(_) | RpcError::Poisoned(_))
-                    {
-                        warn!("Retrying after encountering error while updating table metadata: {e}");
-                        Ok(())
-                    } else {
-                        Err(e)
-                    }
-                })?;
             return Ok(());
         }
 
@@ -933,10 +928,8 @@ impl LogFetcher {
                 self.log_scanner_status
                     .update_offset(&table_bucket, next_fetch_offset);
             }
-
-            if next_in_line_fetch.is_consumed() && next_in_line_fetch.records_read() > 0 {
-                self.log_scanner_status
-                    .move_bucket_to_end(table_bucket.clone());
+            if !records.is_empty() {
+                self.log_scanner_status.move_bucket_to_end(table_bucket);
             }
 
             Ok(records)
@@ -985,12 +978,12 @@ impl LogFetcher {
                             "Skipping fetch request for bucket {bucket} because previous request to server {leader} has not been processed."
                         )
                     } else {
-                    let fetch_log_req_for_bucket = PbFetchLogReqForBucket {
-                        partition_id: None,
-                        bucket_id: bucket.bucket_id(),
-                        fetch_offset: offset,
-                        max_fetch_bytes: self.max_bucket_fetch_bytes,
-                    };
+                        let fetch_log_req_for_bucket = PbFetchLogReqForBucket {
+                            partition_id: bucket.partition_id(),
+                            bucket_id: bucket.bucket_id(),
+                            fetch_offset: offset,
+                            max_fetch_bytes: self.max_bucket_fetch_bytes,
+                        };
 
                         fetch_log_req_for_buckets
                             .entry(leader)
@@ -1177,73 +1170,80 @@ impl BucketScanStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::metadata::Metadata;
-    use crate::client::WriteRecord;
     use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
+    use crate::metadata::{DataField, DataTypes, Schema, TableDescriptor};
     use crate::compression::{
         ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
     };
-    use crate::config::Config;
-    use crate::metadata::{DataField, DataTypes, Schema, TableDescriptor, TableInfo, TablePath};
     use crate::record::MemoryLogRecordsArrowBuilder;
     use crate::row::{Datum, GenericRow};
-    use crate::rpc::FlussError;
-    use std::time::Duration;
+    use crate::client::write::WriteRecord;
     use std::thread;
+    use std::time::Duration;
 
-    fn build_table_info(table_path: TablePath, table_id: i64) -> TableInfo {
-        let row_type = DataTypes::row(vec![DataField::new(
-            "id".to_string(),
-            DataTypes::int(),
-            None,
-        )]);
-        let mut schema_builder = Schema::builder().with_row_type(&row_type);
-        let schema = schema_builder.build().expect("schema build");
+    fn build_table_info(num_buckets: i32) -> TableInfo {
+        let row_type = DataTypes::row(vec![
+            DataField::new("id".to_string(), DataTypes::int(), None),
+            DataField::new("name".to_string(), DataTypes::string(), None),
+        ]);
+        let schema = Schema::builder()
+            .with_row_type(&row_type)
+            .build()
+            .expect("schema");
         let table_descriptor = TableDescriptor::builder()
             .schema(schema)
-            .distributed_by(Some(1), vec![])
+            .distributed_by(Some(num_buckets), vec![])
             .build()
-            .expect("descriptor build");
-        TableInfo::of(table_path, table_id, 1, table_descriptor, 0, 0)
+            .expect("descriptor");
+        TableInfo::of(
+            TablePath::new("db".to_string(), "tbl".to_string()),
+            1,
+            1,
+            table_descriptor,
+            0,
+            0,
+        )
     }
 
-    fn build_cluster(table_path: &TablePath, table_id: i64) -> Arc<Cluster> {
-        let server = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
-        let table_bucket = TableBucket::new(table_id, 0);
-        let bucket_location =
-            BucketLocation::new(table_bucket.clone(), Some(server.clone()), table_path.clone());
+    fn build_cluster(table_info: &TableInfo, leader: &ServerNode) -> Arc<Cluster> {
+        let mut alive_tablet_servers_by_id = HashMap::new();
+        alive_tablet_servers_by_id.insert(leader.id(), leader.clone());
 
-        let mut servers = HashMap::new();
-        servers.insert(server.id(), server);
+        let mut available_locations_by_path = HashMap::new();
+        let mut available_locations_by_bucket = HashMap::new();
+        let mut locations = Vec::new();
 
-        let mut locations_by_path = HashMap::new();
-        locations_by_path.insert(table_path.clone(), vec![bucket_location.clone()]);
-
-        let mut locations_by_bucket = HashMap::new();
-        locations_by_bucket.insert(table_bucket, bucket_location);
+        for bucket in 0..table_info.num_buckets {
+            let table_bucket = TableBucket::new(table_info.table_id, bucket);
+            let location = BucketLocation::new(
+                table_bucket.clone(),
+                Some(leader.clone()),
+                table_info.table_path.clone(),
+            );
+            available_locations_by_bucket.insert(table_bucket, location.clone());
+            locations.push(location);
+        }
+        available_locations_by_path.insert(table_info.table_path.clone(), locations);
 
         let mut table_id_by_path = HashMap::new();
-        table_id_by_path.insert(table_path.clone(), table_id);
-
+        table_id_by_path.insert(table_info.table_path.clone(), table_info.table_id);
         let mut table_info_by_path = HashMap::new();
-        table_info_by_path.insert(
-            table_path.clone(),
-            build_table_info(table_path.clone(), table_id),
-        );
+        table_info_by_path.insert(table_info.table_path.clone(), table_info.clone());
 
         Arc::new(Cluster::new(
             None,
-            servers,
-            locations_by_path,
-            locations_by_bucket,
+            alive_tablet_servers_by_id,
+            available_locations_by_path,
+            available_locations_by_bucket,
             table_id_by_path,
             table_info_by_path,
         ))
     }
 
-    fn build_records(table_info: &TableInfo, table_path: Arc<TablePath>) -> Result<Vec<u8>> {
+    fn build_record_bytes(table_info: &TableInfo) -> Result<Vec<u8>> {
+        let table_path = Arc::new(table_info.table_path.clone());
         let mut builder = MemoryLogRecordsArrowBuilder::new(
-            1,
+            table_info.schema_id,
             table_info.get_row_type(),
             false,
             ArrowCompressionInfo {
@@ -1254,221 +1254,353 @@ mod tests {
         let record = WriteRecord::new(
             table_path,
             GenericRow {
-                values: vec![Datum::Int32(1)],
+                values: vec![Datum::Int32(1), Datum::String("alice")],
             },
         );
         builder.append(&record)?;
         builder.build()
     }
 
-    #[tokio::test]
-    async fn collect_fetches_updates_offset() -> Result<()> {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let table_info = build_table_info(table_path.clone(), 1);
-        let cluster = build_cluster(&table_path, 1);
-        let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let status = Arc::new(LogScannerStatus::new());
+    #[test]
+    fn collect_fetches_updates_offset_and_returns_records() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let log_scanner_status = Arc::new(LogScannerStatus::new());
+        let config = Config::default();
+        let conns = Arc::new(RpcClient::new());
+
         let fetcher = LogFetcher::new(
             table_info.clone(),
-            Arc::new(RpcClient::new()),
+            conns,
             metadata,
-            status.clone(),
-            Config::default(),
+            log_scanner_status.clone(),
+            &config,
             None,
         )?;
 
-        let bucket = TableBucket::new(1, 0);
-        status.assign_scan_bucket(bucket.clone(), 0);
+        let table_bucket = TableBucket::new(table_info.table_id, 0);
+        log_scanner_status.assign_scan_bucket(table_bucket.clone(), 0);
 
-        let data = build_records(&table_info, Arc::new(table_path))?;
-        let log_records = LogRecordsBatches::new(data.clone());
+        let record_bytes = build_record_bytes(&table_info)?;
+        let log_record_batch = LogRecordsBatches::new(record_bytes.clone());
         let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type()), false);
-        let completed = DefaultCompletedFetch::new(
-            bucket.clone(),
-            log_records,
-            data.len(),
+        let completed_fetch = DefaultCompletedFetch::new(
+            table_bucket.clone(),
+            log_record_batch,
+            record_bytes.len(),
             read_context,
             0,
-            0,
+            1,
         )?;
-        fetcher.log_fetch_buffer.add(Box::new(completed));
 
-        let fetched = fetcher.collect_fetches()?;
-        assert_eq!(fetched.get(&bucket).unwrap().len(), 1);
-        assert_eq!(status.get_bucket_offset(&bucket), Some(1));
+        fetcher.log_fetch_buffer.add(Box::new(completed_fetch));
+
+        let result = fetcher.collect_fetches()?;
+        let records = result.get(&table_bucket).expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(log_scanner_status.get_bucket_offset(&table_bucket), Some(1));
+
         Ok(())
     }
 
     #[test]
-    fn fetch_records_from_fetch_drains_unassigned_bucket() -> Result<()> {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let table_info = build_table_info(table_path.clone(), 1);
-        let cluster = build_cluster(&table_path, 1);
-        let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let status = Arc::new(LogScannerStatus::new());
+    fn fetch_records_drain_when_unassigned() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let log_scanner_status = Arc::new(LogScannerStatus::new());
+        let config = Config::default();
+        let conns = Arc::new(RpcClient::new());
+
         let fetcher = LogFetcher::new(
             table_info.clone(),
-            Arc::new(RpcClient::new()),
+            conns,
             metadata,
-            status,
-            Config::default(),
+            log_scanner_status.clone(),
+            &config,
             None,
         )?;
 
-        let bucket = TableBucket::new(1, 0);
-        let data = build_records(&table_info, Arc::new(table_path))?;
-        let log_records = LogRecordsBatches::new(data.clone());
+        let table_bucket = TableBucket::new(table_info.table_id, 0);
+        log_scanner_status.assign_scan_bucket(table_bucket.clone(), 0);
+
+        let record_bytes = build_record_bytes(&table_info)?;
+        let log_record_batch = LogRecordsBatches::new(record_bytes.clone());
         let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type()), false);
-        let mut completed: Box<dyn CompletedFetch> = Box::new(DefaultCompletedFetch::new(
-            bucket,
-            log_records,
-            data.len(),
+        let mut completed_fetch: Box<dyn CompletedFetch> = Box::new(DefaultCompletedFetch::new(
+            table_bucket.clone(),
+            log_record_batch,
+            record_bytes.len(),
             read_context,
             0,
             0,
         )?);
 
-        let records = fetcher.fetch_records_from_fetch(&mut completed, 10)?;
+        log_scanner_status.unassign_scan_buckets(&[table_bucket.clone()]);
+        let records = fetcher.fetch_records_from_fetch(&mut completed_fetch, 10)?;
         assert!(records.is_empty());
-        assert!(completed.is_consumed());
+        assert!(completed_fetch.is_consumed());
+
         Ok(())
     }
 
     #[tokio::test]
-    async fn prepare_fetch_log_requests_skips_pending() -> Result<()> {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let table_info = build_table_info(table_path.clone(), 1);
-        let cluster = build_cluster(&table_path, 1);
-        let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let status = Arc::new(LogScannerStatus::new());
-        status.assign_scan_bucket(TableBucket::new(1, 0), 0);
+    async fn prepare_fetch_log_requests_skips_pending_node() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let log_scanner_status = Arc::new(LogScannerStatus::new());
+        let config = Config::default();
+        let conns = Arc::new(RpcClient::new());
+
         let fetcher = LogFetcher::new(
-            table_info,
-            Arc::new(RpcClient::new()),
+            table_info.clone(),
+            conns,
             metadata,
-            status,
-            Config::default(),
+            log_scanner_status.clone(),
+            &config,
             None,
         )?;
+
+        let leader_id = leader.id();
+        let table_bucket = TableBucket::new(table_info.table_id, 0);
+        log_scanner_status.assign_scan_bucket(table_bucket, 5);
 
         fetcher
             .nodes_with_pending_fetch_requests
             .lock()
-            .insert(1);
+            .insert(leader_id);
+        let empty_requests = fetcher.prepare_fetch_log_requests().await;
+        assert!(empty_requests.is_empty());
 
+        fetcher
+            .nodes_with_pending_fetch_requests
+            .lock()
+            .remove(&leader_id);
         let requests = fetcher.prepare_fetch_log_requests().await;
-        assert!(requests.is_empty());
+        let request = requests.get(&leader_id).expect("request");
+        assert_eq!(request.max_bytes, config.scanner_log_fetch_max_bytes);
+        assert_eq!(
+            request.max_wait_ms,
+            Some(config.scanner_log_fetch_wait_max_ms)
+        );
+        assert_eq!(request.min_bytes, Some(config.scanner_log_fetch_min_bytes));
+        let bucket_req = &request.tables_req[0].buckets_req[0];
+        assert_eq!(
+            bucket_req.max_fetch_bytes,
+            config.scanner_log_fetch_max_bytes_for_bucket
+        );
+        assert_eq!(bucket_req.fetch_offset, 5);
+
         Ok(())
     }
 
     #[tokio::test]
-    async fn handle_fetch_response_sets_error() -> Result<()> {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let table_info = build_table_info(table_path.clone(), 1);
-        let cluster = build_cluster(&table_path, 1);
-        let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let status = Arc::new(LogScannerStatus::new());
-        status.assign_scan_bucket(TableBucket::new(1, 0), 5);
-        let fetcher = LogFetcher::new(
-            table_info.clone(),
-            Arc::new(RpcClient::new()),
-            metadata.clone(),
-            status.clone(),
-            Config::default(),
-            None,
-        )?;
+    async fn handle_fetch_response_sets_error_for_auth() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let log_scanner_status = Arc::new(LogScannerStatus::new());
+        let conns = Arc::new(RpcClient::new());
+        let log_fetch_buffer = Arc::new(LogFetchBuffer::new());
+
+        let table_bucket = TableBucket::new(table_info.table_id, 0);
+        log_scanner_status.assign_scan_bucket(table_bucket.clone(), 0);
+
+        let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type()), false);
+        let remote_read_context =
+            ReadContext::new(to_arrow_schema(table_info.get_row_type()), true);
+        let tmp_dir = TempDir::with_prefix("fluss-remote-logs")?;
+        let remote_log_downloader = Arc::new(RemoteLogDownloader::new(tmp_dir)?);
+        let credentials_cache = Arc::new(CredentialsCache::new(conns, metadata.clone()));
 
         let response = crate::proto::FetchLogResponse {
             tables_resp: vec![crate::proto::PbFetchLogRespForTable {
-                table_id: 1,
+                table_id: table_info.table_id,
                 buckets_resp: vec![crate::proto::PbFetchLogRespForBucket {
-                    bucket_id: 0,
+                    bucket_id: table_bucket.bucket_id(),
                     error_code: Some(FlussError::AuthorizationException.code()),
                     error_message: Some("denied".to_string()),
                     ..Default::default()
                 }],
-                ..Default::default()
             }],
         };
 
         LogFetcher::handle_fetch_response(
             response,
-            &fetcher.log_fetch_buffer,
-            &fetcher.log_scanner_status,
+            &log_fetch_buffer,
+            &log_scanner_status,
             &metadata,
-            &TablePath::new("db".to_string(), "tbl".to_string()),
-            &fetcher.read_context,
-            &fetcher.remote_read_context,
-            &fetcher.remote_log_downloader,
-            &fetcher.credentials_cache,
+            &table_info.table_path,
+            &read_context,
+            &remote_read_context,
+            &remote_log_downloader,
+            &credentials_cache,
         )
         .await?;
 
-        let error = fetcher.log_fetch_buffer.take_error().expect("error");
+        let error = log_fetch_buffer.take_error().expect("error");
         assert!(matches!(error, Error::FlussAPIError { .. }));
+
         Ok(())
     }
 
     #[tokio::test]
-    async fn poll_without_subscription_returns_error() -> Result<()> {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let table_info = build_table_info(table_path.clone(), 1);
-        let cluster = build_cluster(&table_path, 1);
-        let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let scanner = LogScanner::new(
-            &table_info,
+    async fn handle_fetch_response_out_of_range_sets_error() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let log_scanner_status = Arc::new(LogScannerStatus::new());
+        let conns = Arc::new(RpcClient::new());
+        let log_fetch_buffer = Arc::new(LogFetchBuffer::new());
+
+        let table_bucket = TableBucket::new(table_info.table_id, 0);
+        log_scanner_status.assign_scan_bucket(table_bucket.clone(), 5);
+
+        let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type()), false);
+        let remote_read_context =
+            ReadContext::new(to_arrow_schema(table_info.get_row_type()), true);
+        let tmp_dir = TempDir::with_prefix("fluss-remote-logs")?;
+        let remote_log_downloader = Arc::new(RemoteLogDownloader::new(tmp_dir)?);
+        let credentials_cache = Arc::new(CredentialsCache::new(conns, metadata.clone()));
+
+        let response = crate::proto::FetchLogResponse {
+            tables_resp: vec![crate::proto::PbFetchLogRespForTable {
+                table_id: table_info.table_id,
+                buckets_resp: vec![crate::proto::PbFetchLogRespForBucket {
+                    bucket_id: table_bucket.bucket_id(),
+                    error_code: Some(FlussError::LogOffsetOutOfRangeException.code()),
+                    error_message: Some("out of range".to_string()),
+                    ..Default::default()
+                }],
+            }],
+        };
+
+        LogFetcher::handle_fetch_response(
+            response,
+            &log_fetch_buffer,
+            &log_scanner_status,
+            &metadata,
+            &table_info.table_path,
+            &read_context,
+            &remote_read_context,
+            &remote_log_downloader,
+            &credentials_cache,
+        )
+        .await?;
+
+        let error = log_fetch_buffer.take_error().expect("error");
+        assert!(matches!(error, Error::UnexpectedError { .. }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn initialize_fetch_discards_stale_offset() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let log_scanner_status = Arc::new(LogScannerStatus::new());
+        let config = Config::default();
+        let conns = Arc::new(RpcClient::new());
+
+        log_scanner_status.assign_scan_bucket(TableBucket::new(table_info.table_id, 0), 5);
+        let fetcher = LogFetcher::new(
+            table_info.clone(),
+            conns,
             metadata,
-            Arc::new(RpcClient::new()),
-            Config::default(),
+            log_scanner_status,
+            &config,
             None,
         )?;
 
-        let result = scanner.poll(Duration::from_millis(1)).await;
-        assert!(matches!(result, Err(Error::IllegalArgument { .. })));
+        let record_bytes = build_record_bytes(&table_info)?;
+        let log_records = LogRecordsBatches::new(record_bytes.clone());
+        let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type()), false);
+        let completed: Box<dyn CompletedFetch> = Box::new(DefaultCompletedFetch::new(
+            TableBucket::new(table_info.table_id, 0),
+            log_records,
+            record_bytes.len(),
+            read_context,
+            0,
+            0,
+        )?);
+
+        let result = fetcher.initialize_fetch(completed)?;
+        assert!(result.is_none());
         Ok(())
     }
 
     #[tokio::test]
-    async fn poll_wakeup_returns_empty() -> Result<()> {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let table_info = build_table_info(table_path.clone(), 1);
-        let cluster = build_cluster(&table_path, 1);
-        let metadata = Arc::new(Metadata::new_for_test(cluster));
+    async fn poll_without_subscription_returns_empty() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let config = Config::default();
         let scanner = LogScanner::new(
             &table_info,
             metadata,
             Arc::new(RpcClient::new()),
-            Config::default(),
+            &config,
+            None,
+        )?;
+
+        let result = scanner.poll(Duration::from_millis(1)).await?;
+        assert!(result.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn poll_wakeup_returns_error() -> Result<()> {
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let config = Config::default();
+        let scanner = LogScanner::new(
+            &table_info,
+            metadata,
+            Arc::new(RpcClient::new()),
+            &config,
             None,
         )?;
 
         scanner
             .log_scanner_status
-            .assign_scan_bucket(TableBucket::new(1, 0), 0);
+            .assign_scan_bucket(TableBucket::new(table_info.table_id, 0), 0);
         scanner.wakeup();
 
-        let result = scanner.poll(Duration::from_millis(5)).await?;
-        assert!(result.is_empty());
+        let result = scanner.poll(Duration::from_millis(5)).await;
+        assert!(matches!(result, Err(Error::WakeupError { .. })));
         Ok(())
     }
 
     #[test]
     fn log_scanner_rejects_concurrent_access() -> Result<()> {
-        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let table_info = build_table_info(table_path.clone(), 1);
-        let cluster = build_cluster(&table_path, 1);
-        let metadata = Arc::new(Metadata::new_for_test(cluster));
+        let table_info = build_table_info(1);
+        let leader =
+            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Arc::new(Metadata::new_for_test(build_cluster(&table_info, &leader)));
+        let config = Config::default();
         let scanner = Arc::new(LogScanner::new(
             &table_info,
             metadata,
             Arc::new(RpcClient::new()),
-            Config::default(),
+            &config,
             None,
         )?);
 
-        let guard = scanner.acquire()?;
+        let guard = scanner.thread_access.acquire()?;
         let scanner_clone = scanner.clone();
-        let handle = thread::spawn(move || scanner_clone.acquire().is_err());
+        let handle = thread::spawn(move || scanner_clone.thread_access.acquire().is_err());
         let denied = handle.join().expect("thread join");
         drop(guard);
 

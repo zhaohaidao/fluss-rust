@@ -1053,9 +1053,16 @@ pub struct MyVec<T>(pub StreamReader<T>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::DataTypes;
-    use crate::metadata::DataField;
+    use crate::client::WriteRecord;
+    use crate::compression::{
+        ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+    };
+    use crate::metadata::{DataField, DataTypes, TablePath};
+    use crate::row::{Datum, GenericRow};
     use crate::error::Error;
+    use arrow::array::Int32Array;
+    use bytes::Bytes;
+    use std::sync::Arc;
 
     #[test]
     fn test_to_array_type() {
@@ -1237,6 +1244,86 @@ mod tests {
         let result = ReadContext::with_projection_pushdown(schema, vec![0, 2], false);
 
         assert!(matches!(result, Err(Error::IllegalArgument { .. })));
+    }
+
+    fn build_log_record_bytes(values: Vec<i32>) -> Result<Vec<u8>> {
+        let fields = values
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| DataField::new(format!("c{idx}"), DataTypes::int(), None))
+            .collect::<Vec<_>>();
+        let row_type = DataTypes::row(fields);
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+        let mut builder = MemoryLogRecordsArrowBuilder::new(
+            1,
+            &row_type,
+            false,
+            ArrowCompressionInfo {
+                compression_type: ArrowCompressionType::None,
+                compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+            },
+        );
+        let record = WriteRecord::new(
+            table_path,
+            GenericRow {
+                values: values.into_iter().map(Datum::Int32).collect(),
+            },
+        );
+        builder.append(&record)?;
+        builder.build()
+    }
+
+    #[test]
+    fn log_records_batches_iterates_over_concatenated_batches() -> Result<()> {
+        let batch_bytes = build_log_record_bytes(vec![1, 2, 3])?;
+        let mut data = batch_bytes.clone();
+        data.extend_from_slice(&batch_bytes);
+
+        let mut batches = LogRecordsBatches::new(data);
+        let first = batches.next().expect("first batch");
+        assert!(first.is_valid());
+        assert!(batches.next().is_some());
+        assert!(batches.next().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn log_record_batch_detects_bad_checksum() -> Result<()> {
+        let mut batch_bytes = build_log_record_bytes(vec![1])?;
+        batch_bytes[CRC_OFFSET] ^= 0xFF;
+        let batch = LogRecordBatch::new(Bytes::from(batch_bytes));
+        assert!(batch.ensure_valid().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn log_record_batch_projection_reorders_columns() -> Result<()> {
+        let batch_bytes = build_log_record_bytes(vec![10, 20, 30])?;
+        let batch = LogRecordBatch::new(Bytes::from(batch_bytes));
+
+        let row_type = DataTypes::row(vec![
+            DataField::new("c0".to_string(), DataTypes::int(), None),
+            DataField::new("c1".to_string(), DataTypes::int(), None),
+            DataField::new("c2".to_string(), DataTypes::int(), None),
+        ]);
+        let schema = to_arrow_schema(&row_type);
+        let read_context = ReadContext::with_projection_pushdown(schema, vec![2, 0], false)?;
+
+        let mut records = batch.records(&read_context)?;
+        let record = records.next().expect("record");
+        let row_id = record.row().get_row_id();
+        let record_batch = record.row().get_record_batch();
+
+        assert_eq!(record_batch.num_columns(), 2);
+        assert_eq!(record_batch.schema().field(0).name(), "c2");
+        assert_eq!(record_batch.schema().field(1).name(), "c0");
+        let first = record_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(first.len(), row_id + 1);
+        Ok(())
     }
 
     fn le_bytes(vals: &[u32]) -> Vec<u8> {

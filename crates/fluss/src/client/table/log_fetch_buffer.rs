@@ -32,7 +32,6 @@ pub trait CompletedFetch: Send + Sync {
     fn table_bucket(&self) -> &TableBucket;
     fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>>;
     fn is_consumed(&self) -> bool;
-    fn records_read(&self) -> usize;
     fn drain(&mut self);
     fn size_in_bytes(&self) -> usize;
     fn high_watermark(&self) -> i64;
@@ -251,6 +250,12 @@ impl LogFetchBuffer {
         buckets.extend(pending.keys().cloned());
         buckets
     }
+
+    #[cfg(test)]
+    fn pended_buckets(&self) -> Vec<TableBucket> {
+        let pending = self.pending_fetches.lock();
+        pending.keys().cloned().collect()
+    }
 }
 
 impl Default for LogFetchBuffer {
@@ -294,7 +299,6 @@ pub struct DefaultCompletedFetch {
     size_in_bytes: usize,
     consumed: bool,
     initialized: bool,
-    records_read: usize,
     current_record_iterator: Option<LogRecordIterator>,
     current_record_batch: Option<LogRecordBatch>,
     last_record: Option<ScanRecord>,
@@ -320,7 +324,6 @@ impl DefaultCompletedFetch {
             size_in_bytes,
             consumed: false,
             initialized: false,
-            records_read: 0,
             current_record_iterator: None,
             current_record_batch: None,
             last_record: None,
@@ -407,7 +410,6 @@ impl CompletedFetch for DefaultCompletedFetch {
             };
 
             self.next_fetch_offset = record.offset() + 1;
-            self.records_read += 1;
             scan_records.push(record);
         }
 
@@ -420,10 +422,6 @@ impl CompletedFetch for DefaultCompletedFetch {
 
     fn is_consumed(&self) -> bool {
         self.consumed
-    }
-
-    fn records_read(&self) -> usize {
-        self.records_read
     }
 
     fn drain(&mut self) {
@@ -464,7 +462,9 @@ mod tests {
     use crate::metadata::{DataField, DataTypes, TablePath};
     use crate::record::{MemoryLogRecordsArrowBuilder, to_arrow_schema};
     use crate::row::GenericRow;
+    use std::collections::HashSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     struct ErrorPendingFetch {
@@ -485,6 +485,62 @@ mod tests {
                 message: "pending fetch failure".to_string(),
                 source: None,
             })
+        }
+    }
+
+    struct TestCompletedFetch {
+        table_bucket: TableBucket,
+        consumed: AtomicBool,
+        initialized: AtomicBool,
+        next_fetch_offset: i64,
+    }
+
+    impl TestCompletedFetch {
+        fn new(table_bucket: TableBucket) -> Self {
+            Self {
+                table_bucket,
+                consumed: AtomicBool::new(false),
+                initialized: AtomicBool::new(true),
+                next_fetch_offset: 0,
+            }
+        }
+    }
+
+    impl CompletedFetch for TestCompletedFetch {
+        fn table_bucket(&self) -> &TableBucket {
+            &self.table_bucket
+        }
+
+        fn fetch_records(&mut self, _max_records: usize) -> Result<Vec<ScanRecord>> {
+            Ok(Vec::new())
+        }
+
+        fn is_consumed(&self) -> bool {
+            self.consumed.load(Ordering::Acquire)
+        }
+
+        fn drain(&mut self) {
+            self.consumed.store(true, Ordering::Release);
+        }
+
+        fn size_in_bytes(&self) -> usize {
+            0
+        }
+
+        fn high_watermark(&self) -> i64 {
+            0
+        }
+
+        fn is_initialized(&self) -> bool {
+            self.initialized.load(Ordering::Acquire)
+        }
+
+        fn set_initialized(&mut self) {
+            self.initialized.store(true, Ordering::Release);
+        }
+
+        fn next_fetch_offset(&self) -> i64 {
+            self.next_fetch_offset
         }
     }
 
@@ -510,6 +566,84 @@ mod tests {
         assert!(matches!(result, Err(Error::UnexpectedError { .. })));
     }
 
+    #[test]
+    fn buffered_buckets_include_pending_and_next_in_line() {
+        let buffer = LogFetchBuffer::new();
+        let bucket_pending = TableBucket::new(1, 0);
+        let bucket_next = TableBucket::new(1, 1);
+        let bucket_completed = TableBucket::new(1, 2);
+
+        buffer.pend(Box::new(ErrorPendingFetch {
+            table_bucket: bucket_pending.clone(),
+        }));
+        buffer.set_next_in_line_fetch(Some(Box::new(TestCompletedFetch::new(
+            bucket_next.clone(),
+        ))));
+        buffer.add(Box::new(TestCompletedFetch::new(bucket_completed.clone())));
+
+        let buckets: HashSet<TableBucket> = buffer.buffered_buckets().into_iter().collect();
+        assert!(buckets.contains(&bucket_pending));
+        assert!(buckets.contains(&bucket_next));
+        assert!(buckets.contains(&bucket_completed));
+    }
+
+    #[test]
+    fn pended_buckets_only_returns_pending() {
+        let buffer = LogFetchBuffer::new();
+        let bucket_pending = TableBucket::new(1, 0);
+        buffer.pend(Box::new(ErrorPendingFetch {
+            table_bucket: bucket_pending.clone(),
+        }));
+        buffer.add(Box::new(TestCompletedFetch::new(TableBucket::new(1, 1))));
+
+        let pending: HashSet<TableBucket> = buffer.pended_buckets().into_iter().collect();
+        assert_eq!(pending, HashSet::from([bucket_pending]));
+    }
+
+    #[test]
+    fn add_with_pending_keeps_buffer_empty_until_completed() {
+        struct PendingGate {
+            table_bucket: TableBucket,
+            completed: Arc<AtomicBool>,
+        }
+
+        impl PendingFetch for PendingGate {
+            fn table_bucket(&self) -> &TableBucket {
+                &self.table_bucket
+            }
+
+            fn is_completed(&self) -> bool {
+                self.completed.load(Ordering::Acquire)
+            }
+
+            fn to_completed_fetch(self: Box<Self>) -> Result<Box<dyn CompletedFetch>> {
+                Ok(Box::new(TestCompletedFetch::new(self.table_bucket.clone())))
+            }
+        }
+
+        let buffer = LogFetchBuffer::new();
+        let bucket = TableBucket::new(1, 0);
+        let completed = Arc::new(AtomicBool::new(false));
+        let pending = PendingGate {
+            table_bucket: bucket.clone(),
+            completed: completed.clone(),
+        };
+        buffer.pend(Box::new(pending));
+
+        buffer.add(Box::new(TestCompletedFetch::new(bucket.clone())));
+        assert!(buffer.is_empty());
+
+        {
+            let pending = buffer.pending_fetches.lock();
+            let entry = pending.get(&bucket).expect("pending");
+            assert_eq!(entry.len(), 2);
+        }
+
+        completed.store(true, Ordering::Release);
+
+        buffer.try_complete(&bucket);
+        assert!(!buffer.is_empty());
+    }
     #[test]
     fn default_completed_fetch_reads_records() -> Result<()> {
         let row_type = DataTypes::row(vec![

@@ -156,8 +156,17 @@ impl Metadata {
 mod tests {
     use super::*;
     use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
-    use crate::metadata::{DataField, DataTypes, Schema, TableDescriptor, TableInfo, TablePath};
+    use crate::metadata::{
+        DataField, DataTypes, JsonSerde, Schema, TableDescriptor, TableInfo, TablePath,
+    };
+    use crate::proto::{MetadataResponse, PbBucketMetadata, PbServerNode, PbTableMetadata, PbTablePath};
+    use crate::rpc::ServerConnection;
+    use prost::Message;
     use std::collections::HashMap;
+    use tokio::io::BufStream;
+    use tokio::task::JoinHandle;
+
+    const API_UPDATE_METADATA: i16 = 1012;
 
     fn build_table_info(table_path: TablePath, table_id: i64) -> TableInfo {
         let row_type = DataTypes::row(vec![DataField::new(
@@ -206,6 +215,87 @@ mod tests {
         ))
     }
 
+    fn build_cluster_with_server(server: ServerNode) -> Arc<Cluster> {
+        Arc::new(Cluster::new(
+            None,
+            HashMap::from([(server.id(), server)]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        ))
+    }
+
+    fn build_metadata_response(table_path: &TablePath, table_id: i64) -> MetadataResponse {
+        let row_type = DataTypes::row(vec![DataField::new(
+            "id".to_string(),
+            DataTypes::int(),
+            None,
+        )]);
+        let mut schema_builder = Schema::builder().with_row_type(&row_type);
+        let schema = schema_builder.build().expect("schema build");
+        let table_descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(1), vec![])
+            .build()
+            .expect("descriptor build");
+        let table_json =
+            serde_json::to_vec(&table_descriptor.serialize_json().expect("table json")).unwrap();
+
+        MetadataResponse {
+            coordinator_server: Some(PbServerNode {
+                node_id: 10,
+                host: "127.0.0.1".to_string(),
+                port: 9999,
+                listeners: None,
+            }),
+            tablet_servers: vec![PbServerNode {
+                node_id: 1,
+                host: "127.0.0.1".to_string(),
+                port: 9092,
+                listeners: None,
+            }],
+            table_metadata: vec![PbTableMetadata {
+                table_path: PbTablePath {
+                    database_name: table_path.database().to_string(),
+                    table_name: table_path.table().to_string(),
+                },
+                table_id,
+                schema_id: 1,
+                table_json,
+                bucket_metadata: vec![PbBucketMetadata {
+                    bucket_id: 0,
+                    leader_id: Some(1),
+                    replica_id: vec![1],
+                }],
+                created_time: 0,
+                modified_time: 0,
+            }],
+            partition_metadata: vec![],
+        }
+    }
+
+    async fn build_mock_connection(
+        response: MetadataResponse,
+    ) -> (ServerConnection, JoinHandle<()>) {
+        let response_bytes = response.encode_to_vec();
+        let (client, server) = tokio::io::duplex(1024);
+        let handle = crate::rpc::spawn_mock_server(server, move |api_key, _, _| {
+            match i16::from(api_key) {
+                API_UPDATE_METADATA => response_bytes.clone(),
+                _ => vec![],
+            }
+        })
+        .await;
+        let transport = crate::rpc::Transport::Test { inner: client };
+        let connection = Arc::new(crate::rpc::ServerConnectionInner::new(
+            BufStream::new(transport),
+            usize::MAX,
+            Arc::from(""),
+        ));
+        (connection, handle)
+    }
+
     #[test]
     fn leader_for_returns_server() {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
@@ -223,5 +313,70 @@ mod tests {
         metadata.invalidate_server(&1, vec![1]);
         let cluster = metadata.get_cluster();
         assert!(cluster.get_tablet_server(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn update_replaces_cluster_state() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let metadata = Metadata::new_for_test(Arc::new(Cluster::default()));
+
+        let response = build_metadata_response(&table_path, 1);
+        metadata.update(response).await?;
+
+        let cluster = metadata.get_cluster();
+        assert!(cluster.get_tablet_server(1).is_some());
+        assert!(cluster.opt_get_table(&table_path).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_and_update_table_metadata_noop_when_present() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let cluster = build_cluster(&table_path, 1);
+        let metadata = Metadata::new_for_test(cluster);
+        metadata
+            .check_and_update_table_metadata(&[table_path.clone()])
+            .await?;
+        let cluster = metadata.get_cluster();
+        assert!(cluster.opt_get_table(&table_path).is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_tables_metadata_refreshes_cluster() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let server = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Metadata::new_for_test(build_cluster_with_server(server.clone()));
+        let response = build_metadata_response(&table_path, 1);
+        let (connection, handle) = build_mock_connection(response).await;
+        metadata
+            .connections
+            .insert_connection_for_test(&server, connection);
+
+        metadata
+            .update_tables_metadata(&HashSet::from([&table_path]))
+            .await?;
+        assert!(metadata.get_cluster().opt_get_table(&table_path).is_some());
+        handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_and_update_table_metadata_triggers_update() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let server = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let metadata = Metadata::new_for_test(build_cluster_with_server(server.clone()));
+        let response = build_metadata_response(&table_path, 1);
+        let (connection, handle) = build_mock_connection(response).await;
+        metadata
+            .connections
+            .insert_connection_for_test(&server, connection);
+
+        metadata
+            .check_and_update_table_metadata(&[table_path.clone()])
+            .await?;
+        assert!(metadata.get_cluster().opt_get_table(&table_path).is_some());
+        handle.abort();
+        Ok(())
     }
 }
