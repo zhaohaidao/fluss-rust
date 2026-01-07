@@ -34,16 +34,20 @@ use arrow_schema::SchemaRef;
 use log::{debug, error, warn};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
+use tokio::time::{Instant, sleep};
 
 const LOG_FETCH_MAX_BYTES: i32 = 16 * 1024 * 1024;
 #[allow(dead_code)]
 const LOG_FETCH_MAX_BYTES_FOR_BUCKET: i32 = 1024;
 const LOG_FETCH_MIN_BYTES: i32 = 1;
 const LOG_FETCH_WAIT_MAX_TIME: i32 = 500;
+const METADATA_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct TableScan<'a> {
     conn: &'a FlussConnection,
@@ -272,6 +276,100 @@ impl LogScanner {
     }
 }
 
+type RefreshFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type RefreshFn = Arc<dyn Fn() -> RefreshFuture + Send + Sync>;
+
+struct MetadataRefreshScheduler {
+    refresh: RefreshFn,
+    min_interval: Duration,
+    table_path: TablePath,
+    state: Arc<Mutex<RefreshState>>,
+}
+
+struct RefreshState {
+    running: bool,
+    pending: bool,
+    last_refresh: Option<Instant>,
+    last_error: Option<FlussError>,
+}
+
+impl MetadataRefreshScheduler {
+    fn new(table_path: TablePath, refresh: RefreshFn, min_interval: Duration) -> Self {
+        Self {
+            refresh,
+            min_interval,
+            table_path,
+            state: Arc::new(Mutex::new(RefreshState {
+                running: false,
+                pending: false,
+                last_refresh: None,
+                last_error: None,
+            })),
+        }
+    }
+
+    fn schedule(&self, error: FlussError) {
+        let state = Arc::clone(&self.state);
+        let refresh = self.refresh.clone();
+        let table_path = self.table_path.clone();
+        let min_interval = self.min_interval;
+
+        {
+            let mut guard = state.lock();
+            guard.pending = true;
+            guard.last_error = Some(error);
+            if guard.running {
+                return;
+            }
+            guard.running = true;
+        }
+
+        tokio::spawn(async move {
+            loop {
+                let (delay, error_for_log) = {
+                    let mut guard = state.lock();
+                    if !guard.pending {
+                        guard.running = false;
+                        return;
+                    }
+                    guard.pending = false;
+
+                    let now = Instant::now();
+                    let delay = match guard.last_refresh {
+                        Some(last) => {
+                            let earliest = last + min_interval;
+                            if now < earliest {
+                                earliest - now
+                            } else {
+                                Duration::from_millis(0)
+                            }
+                        }
+                        None => Duration::from_millis(0),
+                    };
+                    (delay, guard.last_error.take())
+                };
+
+                if !delay.is_zero() {
+                    sleep(delay).await;
+                }
+
+                if let Err(e) = (refresh)().await {
+                    if let Some(error) = error_for_log {
+                        warn!(
+                            "Failed to update metadata for {table_path} after fetch error {error:?}: {e:?}"
+                        );
+                    } else {
+                        warn!("Failed to update metadata for {table_path}: {e:?}");
+                    }
+                }
+
+                let mut guard = state.lock();
+                guard.last_refresh = Some(Instant::now());
+            }
+        });
+    }
+}
+
 struct LogFetcher {
     conns: Arc<RpcClient>,
     metadata: Arc<Metadata>,
@@ -286,6 +384,7 @@ struct LogFetcher {
     nodes_with_pending_fetch_requests: Arc<Mutex<HashSet<i32>>>,
     table_path: TablePath,
     is_partitioned: bool,
+    metadata_refresh: MetadataRefreshScheduler,
 }
 
 impl LogFetcher {
@@ -306,6 +405,22 @@ impl LogFetcher {
             Self::create_read_context(full_arrow_schema, projected_fields.clone(), true)?;
 
         let tmp_dir = TempDir::with_prefix("fluss-remote-logs")?;
+        let table_path = table_info.table_path.clone();
+        let refresh_table_path = table_path.clone();
+        let refresh_metadata = metadata.clone();
+        let metadata_refresh = MetadataRefreshScheduler::new(
+            table_path.clone(),
+            Arc::new(move || {
+                let metadata = refresh_metadata.clone();
+                let table_path = refresh_table_path.clone();
+                Box::pin(async move {
+                    metadata
+                        .update_tables_metadata(&HashSet::from([&table_path]))
+                        .await
+                })
+            }),
+            METADATA_REFRESH_MIN_INTERVAL,
+        );
 
         Ok(LogFetcher {
             conns: conns.clone(),
@@ -317,8 +432,9 @@ impl LogFetcher {
             credentials_cache: Arc::new(CredentialsCache::new(conns.clone(), metadata.clone())),
             log_fetch_buffer: Arc::new(LogFetchBuffer::new()),
             nodes_with_pending_fetch_requests: Arc::new(Mutex::new(HashSet::new())),
-            table_path: table_info.table_path.clone(),
+            table_path,
             is_partitioned: table_info.is_partitioned(),
+            metadata_refresh,
         })
     }
 
@@ -465,7 +581,21 @@ impl LogFetcher {
                 .await
                 {
                     error!("Fail to handle fetch response: {e:?}");
-                    log_fetch_buffer.set_error(e);
+                    let message = format!("Failed to handle fetch response: {e}");
+                    for table_req in &fetch_request.tables_req {
+                        let table_id = table_req.table_id;
+                        for bucket_req in &table_req.buckets_req {
+                            let table_bucket = TableBucket::new(table_id, bucket_req.bucket_id);
+                            log_fetch_buffer.set_error(
+                                table_bucket,
+                                Error::UnexpectedError {
+                                    message: message.clone(),
+                                    source: None,
+                                },
+                                bucket_req.fetch_offset,
+                            );
+                        }
+                    }
                 }
             });
         }
@@ -487,8 +617,8 @@ impl LogFetcher {
         fetch_response: crate::proto::FetchLogResponse,
         log_fetch_buffer: &Arc<LogFetchBuffer>,
         log_scanner_status: &Arc<LogScannerStatus>,
-        metadata: &Arc<Metadata>,
-        table_path: &TablePath,
+        _metadata: &Arc<Metadata>,
+        _table_path: &TablePath,
         read_context: &ReadContext,
         remote_read_context: &ReadContext,
         remote_log_downloader: &Arc<RemoteLogDownloader>,
@@ -521,6 +651,14 @@ impl LogFetcher {
                         .unwrap_or_else(|| error.message().to_string());
 
                     log_scanner_status.move_bucket_to_end(table_bucket.clone());
+                    log_fetch_buffer.add_api_error(
+                        table_bucket.clone(),
+                        ApiError {
+                            code: error_code,
+                            message: error_message.clone(),
+                        },
+                        fetch_offset,
+                    );
 
                     match error {
                         FlussError::NotLeaderOrFollower
@@ -531,43 +669,21 @@ impl LogFetcher {
                             debug!(
                                 "Error in fetch for bucket {table_bucket}: {error:?}: {error_message}"
                             );
-                            if let Err(e) = metadata
-                                .update_tables_metadata(&HashSet::from([table_path]))
-                                .await
-                            {
-                                warn!(
-                                    "Failed to update metadata for {table_path} after fetch error {error:?}: {e:?}"
-                                );
-                            }
                         }
                         FlussError::UnknownTableOrBucketException => {
                             warn!(
                                 "Received unknown table or bucket error in fetch for bucket {table_bucket}"
                             );
-                            if let Err(e) = metadata
-                                .update_tables_metadata(&HashSet::from([table_path]))
-                                .await
-                            {
-                                warn!(
-                                    "Failed to update metadata for {table_path} after unknown table or bucket error: {e:?}"
-                                );
-                            }
                         }
                         FlussError::LogOffsetOutOfRangeException => {
-                            log_fetch_buffer.set_error(Error::UnexpectedError {
-                                message: format!(
-                                    "The fetching offset {fetch_offset} is out of range: {error_message}"
-                                ),
-                                source: None,
-                            });
+                            debug!(
+                                "The fetching offset {fetch_offset} is out of range for bucket {table_bucket}: {error_message}"
+                            );
                         }
                         FlussError::AuthorizationException => {
-                            log_fetch_buffer.set_error(Error::FlussAPIError {
-                                api_error: ApiError {
-                                    code: error_code,
-                                    message: error_message.clone(),
-                                },
-                            });
+                            debug!(
+                                "Authorization error while fetching offset {fetch_offset} for bucket {table_bucket}: {error_message}"
+                            );
                         }
                         FlussError::UnknownServerError => {
                             warn!(
@@ -575,20 +691,14 @@ impl LogFetcher {
                             );
                         }
                         FlussError::CorruptMessage => {
-                            log_fetch_buffer.set_error(Error::UnexpectedError {
-                                message: format!(
-                                    "Encountered corrupt message when fetching offset {fetch_offset} for bucket {table_bucket}: {error_message}"
-                                ),
-                                source: None,
-                            });
+                            debug!(
+                                "Encountered corrupt message when fetching offset {fetch_offset} for bucket {table_bucket}: {error_message}"
+                            );
                         }
                         _ => {
-                            log_fetch_buffer.set_error(Error::UnexpectedError {
-                                message: format!(
-                                    "Unexpected error code {error:?} while fetching at offset {fetch_offset} from bucket {table_bucket}: {error_message}"
-                                ),
-                                source: None,
-                            });
+                            debug!(
+                                "Unexpected error code {error:?} while fetching at offset {fetch_offset} from bucket {table_bucket}: {error_message}"
+                            );
                         }
                     }
                     continue;
@@ -634,7 +744,8 @@ impl LogFetcher {
                         }
                         Err(e) => {
                             warn!("Failed to create completed fetch: {e:?}");
-                            log_fetch_buffer.set_error(e);
+                            log_fetch_buffer
+                                .set_error(table_bucket.clone(), e, fetch_offset);
                         }
                     }
                 }
@@ -695,7 +806,6 @@ impl LogFetcher {
         const MAX_POLL_RECORDS: usize = 500; // Default max poll records
         let mut result: HashMap<TableBucket, Vec<ScanRecord>> = HashMap::new();
         let mut records_remaining = MAX_POLL_RECORDS;
-        let mut pending_error = self.log_fetch_buffer.take_error();
 
         while records_remaining > 0 {
             // Get the next in line fetch, or get a new one from buffer
@@ -724,7 +834,6 @@ impl LogFetcher {
                                 if result.is_empty() {
                                     return Err(e);
                                 }
-                                self.log_fetch_buffer.set_error(e);
                                 break;
                             }
                         }
@@ -747,7 +856,10 @@ impl LogFetcher {
                                 if result.is_empty() {
                                     return Err(e);
                                 }
-                                self.log_fetch_buffer.set_error(e);
+                                if !next_fetch.is_consumed() {
+                                    self.log_fetch_buffer
+                                        .set_next_in_line_fetch(Some(next_fetch));
+                                }
                                 break;
                             }
                         };
@@ -772,17 +884,6 @@ impl LogFetcher {
             }
         }
 
-        if pending_error.is_none() {
-            pending_error = self.log_fetch_buffer.take_error();
-        }
-
-        if let Some(error) = pending_error {
-            if result.is_empty() {
-                return Err(error);
-            }
-            self.log_fetch_buffer.set_error(error);
-        }
-
         Ok(result)
     }
 
@@ -791,12 +892,80 @@ impl LogFetcher {
         &self,
         mut completed_fetch: Box<dyn CompletedFetch>,
     ) -> Result<Option<Box<dyn CompletedFetch>>> {
-        // todo: handle error in initialize fetch
-        let table_bucket = completed_fetch.table_bucket();
+        if let Some(error) = completed_fetch.take_error() {
+            return Err(error);
+        }
+
+        let table_bucket = completed_fetch.table_bucket().clone();
         let fetch_offset = completed_fetch.next_fetch_offset();
 
+        if let Some(api_error) = completed_fetch.api_error() {
+            let error = FlussError::for_code(api_error.code);
+            let error_message = api_error.message.as_str();
+            self.log_scanner_status
+                .move_bucket_to_end(table_bucket.clone());
+            match error {
+                FlussError::NotLeaderOrFollower
+                | FlussError::LogStorageException
+                | FlussError::KvStorageException
+                | FlussError::StorageException
+                | FlussError::FencedLeaderEpochException => {
+                    debug!(
+                        "Error in fetch for bucket {table_bucket}: {error:?}: {error_message}"
+                    );
+                    self.schedule_metadata_update(error);
+                    return Ok(None);
+                }
+                FlussError::UnknownTableOrBucketException => {
+                    warn!(
+                        "Received unknown table or bucket error in fetch for bucket {table_bucket}"
+                    );
+                    self.schedule_metadata_update(error);
+                    return Ok(None);
+                }
+                FlussError::LogOffsetOutOfRangeException => {
+                    return Err(Error::UnexpectedError {
+                        message: format!(
+                            "The fetching offset {fetch_offset} is out of range: {error_message}"
+                        ),
+                        source: None,
+                    });
+                }
+                FlussError::AuthorizationException => {
+                    return Err(Error::FlussAPIError {
+                        api_error: ApiError {
+                            code: api_error.code,
+                            message: api_error.message.to_string(),
+                        },
+                    });
+                }
+                FlussError::UnknownServerError => {
+                    warn!(
+                        "Unknown server error while fetching offset {fetch_offset} for bucket {table_bucket}: {error_message}"
+                    );
+                    return Ok(None);
+                }
+                FlussError::CorruptMessage => {
+                    return Err(Error::UnexpectedError {
+                        message: format!(
+                            "Encountered corrupt message when fetching offset {fetch_offset} for bucket {table_bucket}: {error_message}"
+                        ),
+                        source: None,
+                    });
+                }
+                _ => {
+                    return Err(Error::UnexpectedError {
+                        message: format!(
+                            "Unexpected error code {error:?} while fetching at offset {fetch_offset} from bucket {table_bucket}: {error_message}"
+                        ),
+                        source: None,
+                    });
+                }
+            }
+        }
+
         // Check if bucket is still subscribed
-        let Some(current_offset) = self.log_scanner_status.get_bucket_offset(table_bucket) else {
+        let Some(current_offset) = self.log_scanner_status.get_bucket_offset(&table_bucket) else {
             warn!(
                 "Discarding stale fetch response for bucket {table_bucket:?} since the bucket has been unsubscribed"
             );
@@ -815,7 +984,7 @@ impl LogFetcher {
         let high_watermark = completed_fetch.high_watermark();
         if high_watermark >= 0 {
             self.log_scanner_status
-                .update_high_watermark(table_bucket, high_watermark);
+                .update_high_watermark(&table_bucket, high_watermark);
         }
 
         completed_fetch.set_initialized();
@@ -866,6 +1035,10 @@ impl LogFetcher {
             next_in_line_fetch.drain();
             Ok(Vec::new())
         }
+    }
+
+    fn schedule_metadata_update(&self, error: FlussError) {
+        self.metadata_refresh.schedule(error);
     }
 
     async fn prepare_fetch_log_requests(&self) -> HashMap<i32, FetchLogRequest> {
@@ -1106,6 +1279,9 @@ mod tests {
     use crate::record::MemoryLogRecordsArrowBuilder;
     use crate::row::{Datum, GenericRow};
     use crate::rpc::FlussError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::task::yield_now;
+    use tokio::time::advance;
 
     fn build_table_info(table_path: TablePath, table_id: i64) -> TableInfo {
         let row_type = DataTypes::row(vec![DataField::new(
@@ -1316,8 +1492,46 @@ mod tests {
         )
         .await?;
 
-        let error = fetcher.log_fetch_buffer.take_error().expect("error");
-        assert!(matches!(error, Error::FlussAPIError { .. }));
+        let completed = fetcher
+            .log_fetch_buffer
+            .poll()
+            .expect("completed fetch");
+        let api_error = completed.api_error().expect("api error");
+        assert_eq!(api_error.code, FlussError::AuthorizationException.code());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metadata_refresh_scheduler_coalesces_requests() -> Result<()> {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_ref = counter.clone();
+        let refresh: RefreshFn = Arc::new(move || {
+            let counter = counter_ref.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        let scheduler = MetadataRefreshScheduler::new(
+            TablePath::new("db".to_string(), "tbl".to_string()),
+            refresh,
+            Duration::from_secs(1),
+        );
+
+        scheduler.schedule(FlussError::NotLeaderOrFollower);
+        scheduler.schedule(FlussError::NotLeaderOrFollower);
+        yield_now().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        scheduler.schedule(FlussError::NotLeaderOrFollower);
+        scheduler.schedule(FlussError::NotLeaderOrFollower);
+        yield_now().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
         Ok(())
     }
 }

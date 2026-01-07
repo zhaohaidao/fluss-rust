@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::error::{Error, Result};
+use crate::error::{ApiError, Error, Result};
 use crate::metadata::TableBucket;
 use crate::record::{
     LogRecordBatch, LogRecordIterator, LogRecordsBatches, ReadContext, ScanRecord,
@@ -30,6 +30,8 @@ use tokio::sync::Notify;
 /// Represents a completed fetch that can be consumed
 pub trait CompletedFetch: Send + Sync {
     fn table_bucket(&self) -> &TableBucket;
+    fn api_error(&self) -> Option<&ApiError>;
+    fn take_error(&mut self) -> Option<Error>;
     fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>>;
     fn is_consumed(&self) -> bool;
     fn records_read(&self) -> usize;
@@ -55,7 +57,6 @@ pub struct LogFetchBuffer {
     next_in_line_fetch: Mutex<Option<Box<dyn CompletedFetch>>>,
     not_empty_notify: Notify,
     woken_up: Arc<AtomicBool>,
-    error: Mutex<Option<Error>>,
 }
 
 impl LogFetchBuffer {
@@ -66,7 +67,6 @@ impl LogFetchBuffer {
             next_in_line_fetch: Mutex::new(None),
             not_empty_notify: Notify::new(),
             woken_up: Arc::new(AtomicBool::new(false)),
-            error: Mutex::new(None),
         }
     }
 
@@ -81,10 +81,6 @@ impl LogFetchBuffer {
         let deadline = std::time::Instant::now() + timeout;
 
         loop {
-            if let Some(error) = self.take_error() {
-                return Err(error);
-            }
-
             // Check if buffer is not empty
             if !self.is_empty() {
                 return Ok(true);
@@ -125,16 +121,21 @@ impl LogFetchBuffer {
         self.not_empty_notify.notify_waiters();
     }
 
-    pub(crate) fn set_error(&self, error: Error) {
-        let mut guard = self.error.lock();
-        if guard.is_none() {
-            *guard = Some(error);
-        }
+    pub(crate) fn set_error(&self, table_bucket: TableBucket, error: Error, fetch_offset: i64) {
+        let error_fetch = ErrorCompletedFetch::from_error(table_bucket, error, fetch_offset);
+        self.completed_fetches.lock().push_back(Box::new(error_fetch));
         self.not_empty_notify.notify_waiters();
     }
 
-    pub(crate) fn take_error(&self) -> Option<Error> {
-        self.error.lock().take()
+    pub(crate) fn add_api_error(
+        &self,
+        table_bucket: TableBucket,
+        api_error: ApiError,
+        fetch_offset: i64,
+    ) {
+        let error_fetch = ErrorCompletedFetch::from_api_error(table_bucket, api_error, fetch_offset);
+        self.completed_fetches.lock().push_back(Box::new(error_fetch));
+        self.not_empty_notify.notify_waiters();
     }
 
     /// Add a pending fetch to the buffer
@@ -182,16 +183,17 @@ impl LogFetchBuffer {
             }
         }
 
+        if let Some(error) = pending_error {
+            let error_fetch = ErrorCompletedFetch::from_error(table_bucket.clone(), error, -1);
+            completed_to_push.push(Box::new(error_fetch));
+        }
+
         if !completed_to_push.is_empty() {
             let mut completed_queue = self.completed_fetches.lock();
             for completed in completed_to_push {
                 completed_queue.push_back(completed);
             }
-        }
-
-        if let Some(error) = pending_error {
-            self.set_error(error);
-            return;
+            has_completed = true;
         }
 
         if has_completed {
@@ -284,6 +286,104 @@ impl PendingFetch for CompletedPendingFetch {
     }
 }
 
+struct ErrorCompletedFetch {
+    table_bucket: TableBucket,
+    api_error: Option<ApiError>,
+    error: Option<Error>,
+    next_fetch_offset: i64,
+    consumed: bool,
+    initialized: bool,
+}
+
+impl ErrorCompletedFetch {
+    fn from_error(table_bucket: TableBucket, error: Error, fetch_offset: i64) -> Self {
+        Self {
+            table_bucket,
+            api_error: None,
+            error: Some(error),
+            next_fetch_offset: fetch_offset,
+            consumed: false,
+            initialized: false,
+        }
+    }
+
+    fn from_api_error(table_bucket: TableBucket, api_error: ApiError, fetch_offset: i64) -> Self {
+        Self {
+            table_bucket,
+            api_error: Some(api_error),
+            error: None,
+            next_fetch_offset: fetch_offset,
+            consumed: false,
+            initialized: false,
+        }
+    }
+}
+
+impl CompletedFetch for ErrorCompletedFetch {
+    fn table_bucket(&self) -> &TableBucket {
+        &self.table_bucket
+    }
+
+    fn api_error(&self) -> Option<&ApiError> {
+        self.api_error.as_ref()
+    }
+
+    fn take_error(&mut self) -> Option<Error> {
+        self.error.take()
+    }
+
+    fn fetch_records(&mut self, _max_records: usize) -> Result<Vec<ScanRecord>> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+
+        if let Some(api_error) = self.api_error.as_ref() {
+            return Err(Error::FlussAPIError {
+                api_error: ApiError {
+                    code: api_error.code,
+                    message: api_error.message.clone(),
+                },
+            });
+        }
+
+        Ok(Vec::new())
+    }
+
+    fn is_consumed(&self) -> bool {
+        self.consumed
+    }
+
+    fn records_read(&self) -> usize {
+        0
+    }
+
+    fn drain(&mut self) {
+        self.consumed = true;
+        self.api_error = None;
+        self.error = None;
+    }
+
+    fn size_in_bytes(&self) -> usize {
+        0
+    }
+
+    fn high_watermark(&self) -> i64 {
+        -1
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    fn set_initialized(&mut self) {
+        self.initialized = true;
+    }
+
+    fn next_fetch_offset(&self) -> i64 {
+        self.next_fetch_offset
+    }
+}
+
 /// Default implementation of CompletedFetch for in-memory log records
 pub struct DefaultCompletedFetch {
     table_bucket: TableBucket,
@@ -371,6 +471,14 @@ impl DefaultCompletedFetch {
 impl CompletedFetch for DefaultCompletedFetch {
     fn table_bucket(&self) -> &TableBucket {
         &self.table_bucket
+    }
+
+    fn api_error(&self) -> Option<&ApiError> {
+        None
+    }
+
+    fn take_error(&mut self) -> Option<Error> {
+        None
     }
 
     fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>> {
@@ -507,7 +615,10 @@ mod tests {
         buffer.try_complete(&table_bucket);
 
         let result = buffer.await_not_empty(Duration::from_millis(10)).await;
-        assert!(matches!(result, Err(Error::UnexpectedError { .. })));
+        assert!(matches!(result, Ok(true)));
+
+        let mut completed = buffer.poll().expect("completed fetch");
+        assert!(completed.take_error().is_some());
     }
 
     #[test]
