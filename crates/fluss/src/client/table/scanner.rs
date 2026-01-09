@@ -1281,7 +1281,7 @@ mod tests {
     use crate::rpc::FlussError;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::task::yield_now;
-    use tokio::time::advance;
+    use tokio::time::sleep;
 
     fn build_table_info(table_path: TablePath, table_id: i64) -> TableInfo {
         let row_type = DataTypes::row(vec![DataField::new(
@@ -1501,7 +1501,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn metadata_refresh_scheduler_coalesces_requests() -> Result<()> {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_ref = counter.clone();
@@ -1516,7 +1516,7 @@ mod tests {
         let scheduler = MetadataRefreshScheduler::new(
             TablePath::new("db".to_string(), "tbl".to_string()),
             refresh,
-            Duration::from_secs(1),
+            Duration::from_millis(50),
         );
 
         scheduler.schedule(FlussError::NotLeaderOrFollower);
@@ -1529,7 +1529,10 @@ mod tests {
         yield_now().await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
 
-        advance(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(10)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        sleep(Duration::from_millis(60)).await;
         yield_now().await;
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         Ok(())
