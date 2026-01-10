@@ -138,20 +138,23 @@ impl RecordAccumulator {
         abort_if_batch_full: bool,
     ) -> Result<RecordAppendResult> {
         let table_path = &record.table_path;
-        let mut binding = self
-            .write_batches
-            .entry(table_path.as_ref().clone())
-            .or_insert_with(|| BucketAndWriteBatches {
-                table_id: 0,
-                is_partitioned_table: false,
-                partition_id: None,
-                batches: Default::default(),
-            });
-        let bucket_and_batches = binding.value_mut();
-        let dq = bucket_and_batches
-            .batches
-            .entry(bucket_id)
-            .or_insert_with(|| Mutex::new(VecDeque::new()));
+        let dq = {
+            let mut binding = self
+                .write_batches
+                .entry(table_path.as_ref().clone())
+                .or_insert_with(|| BucketAndWriteBatches {
+                    table_id: 0,
+                    is_partitioned_table: false,
+                    partition_id: None,
+                    batches: Default::default(),
+                });
+            let bucket_and_batches = binding.value_mut();
+            bucket_and_batches
+                .batches
+                .entry(bucket_id)
+                .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
+                .clone()
+        };
         let mut dq_guard = dq.lock().await;
         if let Some(append_result) = self.try_append(record, &mut dq_guard)? {
             return Ok(append_result);
@@ -169,13 +172,26 @@ impl RecordAccumulator {
         let mut ready_nodes = HashSet::new();
         let mut next_ready_check_delay_ms = self.batch_timeout_ms;
         let mut unknown_leader_tables = HashSet::new();
-        for entry in self.write_batches.iter() {
-            let table_path = entry.key();
-            let batches = entry.value();
+        let entries: Vec<(TablePath, Vec<(BucketId, Arc<Mutex<VecDeque<WriteBatch>>>)>)> =
+            self.write_batches
+                .iter()
+                .map(|entry| {
+                    let table_path = entry.key().clone();
+                    let batches = entry
+                        .value()
+                        .batches
+                        .iter()
+                        .map(|(bucket_id, batch)| (*bucket_id, Arc::clone(batch)))
+                        .collect();
+                    (table_path, batches)
+                })
+                .collect();
+
+        for (table_path, batches) in entries {
             next_ready_check_delay_ms = self
                 .bucket_ready(
-                    table_path,
-                    batches,
+                    &table_path,
+                    &batches,
                     &mut ready_nodes,
                     &mut unknown_leader_tables,
                     cluster,
@@ -194,7 +210,7 @@ impl RecordAccumulator {
     async fn bucket_ready(
         &self,
         table_path: &TablePath,
-        batches: &BucketAndWriteBatches,
+        batches: &[(BucketId, Arc<Mutex<VecDeque<WriteBatch>>>)],
         ready_nodes: &mut HashSet<ServerNode>,
         unknown_leader_tables: &mut HashSet<TablePath>,
         cluster: &Cluster,
@@ -202,7 +218,7 @@ impl RecordAccumulator {
     ) -> i64 {
         let mut next_delay = next_ready_check_delay_ms;
 
-        for (bucket_id, batch) in batches.batches.iter() {
+        for (bucket_id, batch) in batches {
             let batch_guard = batch.lock().await;
             if batch_guard.is_empty() {
                 continue;
@@ -293,42 +309,45 @@ impl RecordAccumulator {
             nodes_drain_index_guard.insert(node.id(), current_index);
             current_index = (current_index + 1) % buckets.len();
 
-            let bucket_and_write_batches = self.write_batches.get(&table_path);
-            if let Some(bucket_and_write_batches) = bucket_and_write_batches {
-                if let Some(deque) = bucket_and_write_batches
-                    .batches
-                    .get(&table_bucket.bucket_id())
+            let deque = self
+                .write_batches
+                .get(&table_path)
+                .and_then(|bucket_and_write_batches| {
+                    bucket_and_write_batches
+                        .batches
+                        .get(&table_bucket.bucket_id())
+                        .cloned()
+                });
+            if let Some(deque) = deque {
+                let mut maybe_batch = None;
                 {
-                    let mut maybe_batch = None;
-                    {
-                        let mut batch_lock = deque.lock().await;
-                        if !batch_lock.is_empty() {
-                            let first_batch = batch_lock.front().unwrap();
+                    let mut batch_lock = deque.lock().await;
+                    if !batch_lock.is_empty() {
+                        let first_batch = batch_lock.front().unwrap();
 
-                            if size + first_batch.estimated_size_in_bytes() > max_size as i64
-                                && !ready.is_empty()
-                            {
-                                // there is a rare case that a single batch size is larger than the request size
-                                // due to compression; in this case we will still eventually send this batch in
-                                // a single request.
-                                break;
-                            }
-
-                            maybe_batch = Some(batch_lock.pop_front().unwrap());
+                        if size + first_batch.estimated_size_in_bytes() > max_size as i64
+                            && !ready.is_empty()
+                        {
+                            // there is a rare case that a single batch size is larger than the request size
+                            // due to compression; in this case we will still eventually send this batch in
+                            // a single request.
+                            break;
                         }
-                    }
 
-                    if let Some(mut batch) = maybe_batch {
-                        let current_batch_size = batch.estimated_size_in_bytes();
-                        size += current_batch_size;
-
-                        // mark the batch as drained.
-                        batch.drained(current_time_ms());
-                        ready.push(ReadyWriteBatch {
-                            table_bucket,
-                            write_batch: batch,
-                        });
+                        maybe_batch = Some(batch_lock.pop_front().unwrap());
                     }
+                }
+
+                if let Some(mut batch) = maybe_batch {
+                    let current_batch_size = batch.estimated_size_in_bytes();
+                    size += current_batch_size;
+
+                    // mark the batch as drained.
+                    batch.drained(current_time_ms());
+                    ready.push(ReadyWriteBatch {
+                        table_bucket,
+                        write_batch: batch,
+                    });
                 }
             }
             if current_index == start {
@@ -347,20 +366,23 @@ impl RecordAccumulator {
         let table_path = ready_write_batch.write_batch.table_path().clone();
         let bucket_id = ready_write_batch.table_bucket.bucket_id();
         let table_id = u64::try_from(ready_write_batch.table_bucket.table_id()).unwrap_or(0);
-        let mut binding =
-            self.write_batches
-                .entry(table_path)
-                .or_insert_with(|| BucketAndWriteBatches {
-                    table_id,
-                    is_partitioned_table: false,
-                    partition_id: None,
-                    batches: Default::default(),
-                });
-        let bucket_and_batches = binding.value_mut();
-        let dq = bucket_and_batches
-            .batches
-            .entry(bucket_id)
-            .or_insert_with(|| Mutex::new(VecDeque::new()));
+        let dq = {
+            let mut binding =
+                self.write_batches
+                    .entry(table_path)
+                    .or_insert_with(|| BucketAndWriteBatches {
+                        table_id,
+                        is_partitioned_table: false,
+                        partition_id: None,
+                        batches: Default::default(),
+                    });
+            let bucket_and_batches = binding.value_mut();
+            bucket_and_batches
+                .batches
+                .entry(bucket_id)
+                .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
+                .clone()
+        };
         let mut dq_guard = dq.lock().await;
         dq_guard.push_front(ready_write_batch.write_batch);
     }
@@ -411,7 +433,7 @@ struct BucketAndWriteBatches {
     table_id: TableId,
     is_partitioned_table: bool,
     partition_id: Option<PartitionId>,
-    batches: HashMap<BucketId, Mutex<VecDeque<WriteBatch>>>,
+    batches: HashMap<BucketId, Arc<Mutex<VecDeque<WriteBatch>>>>,
 }
 
 pub struct RecordAppendResult {
