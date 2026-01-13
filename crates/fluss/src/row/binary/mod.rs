@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Result;
+mod binary_writer;
 
-fn main() -> Result<()> {
-    let mut config = prost_build::Config::new();
-    config.bytes([".proto.PbProduceLogReqForBucket.records"]);
-    config.compile_protos(&["src/proto/fluss_api.proto"], &["src/proto"])?;
-    Ok(())
+pub use binary_writer::*;
+
+/// The binary row format types, it indicates the generated [`BinaryRow`] type by the [`BinaryWriter`]
+#[allow(dead_code)]
+pub enum BinaryRowFormat {
+    Compacted,
+    Aligned,
+    Indexed,
 }
