@@ -17,12 +17,25 @@
 
 mod types;
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Once};
 use std::time::Duration;
 
 use fluss as fcore;
 
+// 初始化日志系统（只执行一次）
+static INIT_LOGGER: Once = Once::new();
+
+fn init_logger() {
+    INIT_LOGGER.call_once(|| {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+            .format_timestamp_millis()
+            .init();
+        log::info!("Fluss C++ bindings logger initialized");
+    });
+}
+
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+    init_logger();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

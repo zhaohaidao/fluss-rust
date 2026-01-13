@@ -616,7 +616,7 @@ impl LogFetcher {
                     &remote_log_downloader,
                     &creds_cache,
                 )
-                .await
+                    .await
                 {
                     error!("Fail to handle fetch response: {e:?}");
                 }

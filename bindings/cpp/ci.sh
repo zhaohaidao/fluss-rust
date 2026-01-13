@@ -37,12 +37,15 @@ compile() {
 }
 
 build_example() {
-    bazel build //:fluss_cpp_example
+    bazel build //:consume_table
 }
 
 run_example() {
     build_example
-    bazel run //:fluss_cpp_example
+    # 传递除第一个参数外的所有参数给 consume_table
+    shift  # 移除 'run' 参数
+    # 传递 RUST_LOG 环境变量以启用日志
+    bazel run //:consume_table --action_env=RUST_LOG="${RUST_LOG:-warn}" -- "$@"
 }
 
 clean() {
@@ -78,7 +81,7 @@ case $1 in
         build_example
         ;;
     run )
-        run_example
+        run_example "$@"
         ;;
     outputs )
         show_outputs
