@@ -16,43 +16,59 @@
 // under the License.
 
 use crate::cluster::{Cluster, ServerNode, ServerType};
+use crate::error::Result;
 use crate::metadata::{TableBucket, TablePath};
+use crate::proto::MetadataResponse;
 use crate::rpc::message::UpdateMetadataRequest;
 use crate::rpc::{RpcClient, ServerConnection};
+use log::info;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crate::error::Result;
-use crate::proto::MetadataResponse;
-
 #[derive(Default)]
 pub struct Metadata {
     cluster: RwLock<Arc<Cluster>>,
     connections: Arc<RpcClient>,
+    bootstrap: Arc<str>,
 }
 
 impl Metadata {
-    pub async fn new(boot_strap: &str, connections: Arc<RpcClient>) -> Result<Self> {
-        let custer = Self::init_cluster(boot_strap, connections.clone()).await?;
+    pub async fn new(bootstrap: &str, connections: Arc<RpcClient>) -> Result<Self> {
+        let cluster = Self::init_cluster(bootstrap, connections.clone()).await?;
         Ok(Metadata {
-            cluster: RwLock::new(Arc::new(custer)),
+            cluster: RwLock::new(Arc::new(cluster)),
             connections,
+            bootstrap: bootstrap.into(),
         })
     }
 
     async fn init_cluster(boot_strap: &str, connections: Arc<RpcClient>) -> Result<Cluster> {
-        let socker_addrss = boot_strap.parse::<SocketAddr>().unwrap();
+        let socket_address = boot_strap.parse::<SocketAddr>().unwrap();
         let server_node = ServerNode::new(
             -1,
-            socker_addrss.ip().to_string(),
-            socker_addrss.port() as u32,
+            socket_address.ip().to_string(),
+            socket_address.port() as u32,
             ServerType::CoordinatorServer,
         );
         let con = connections.get_connection(&server_node).await?;
         let response = con.request(UpdateMetadataRequest::new(&[])).await?;
         Cluster::from_metadata_response(response, None)
+    }
+
+    async fn reinit_cluster(&self) -> Result<()> {
+        let cluster = Self::init_cluster(&self.bootstrap, self.connections.clone()).await?;
+        *self.cluster.write() = cluster.into();
+        Ok(())
+    }
+
+    pub fn invalidate_server(&self, server_id: &i32, table_ids: Vec<i64>) {
+        // Take a write lock for the entire operation to avoid races between
+        // reading the current cluster state and writing back the updated one.
+        let mut cluster_guard = self.cluster.write();
+        let updated_cluster = cluster_guard.invalidate_server(server_id, table_ids);
+        *cluster_guard = Arc::new(updated_cluster);
     }
 
     pub async fn update(&self, metadata_response: MetadataResponse) -> Result<()> {
@@ -65,7 +81,22 @@ impl Metadata {
     }
 
     pub async fn update_tables_metadata(&self, table_paths: &HashSet<&TablePath>) -> Result<()> {
-        let server = self.cluster.read().get_one_available_server().clone();
+        let maybe_server = {
+            let guard = self.cluster.read();
+            guard.get_one_available_server().cloned()
+        };
+
+        let server = match maybe_server {
+            Some(s) => s,
+            None => {
+                info!(
+                    "No available tablet server to update metadata, attempting to re-initialize cluster using bootstrap server."
+                );
+                self.reinit_cluster().await?;
+                return Ok(());
+            }
+        };
+
         let conn = self.connections.get_connection(&server).await?;
 
         let update_table_paths: Vec<&TablePath> = table_paths.iter().copied().collect();
@@ -104,7 +135,47 @@ impl Metadata {
         guard.clone()
     }
 
-    pub fn leader_for(&self, _table_bucket: &TableBucket) -> Option<&ServerNode> {
-        todo!()
+    pub fn leader_for(&self, table_bucket: &TableBucket) -> Option<ServerNode> {
+        let cluster = self.cluster.read();
+        cluster.leader_for(table_bucket).cloned()
+    }
+}
+
+#[cfg(test)]
+impl Metadata {
+    pub(crate) fn new_for_test(cluster: Arc<Cluster>) -> Self {
+        Metadata {
+            cluster: RwLock::new(cluster),
+            connections: Arc::new(RpcClient::new()),
+            bootstrap: Arc::from(""),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::{TableBucket, TablePath};
+    use crate::test_utils::build_cluster_arc;
+
+    #[test]
+    fn leader_for_returns_server() {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let cluster = build_cluster_arc(&table_path, 1, 1);
+        let metadata = Metadata::new_for_test(cluster);
+        let leader = metadata
+            .leader_for(&TableBucket::new(1, 0))
+            .expect("leader");
+        assert_eq!(leader.id(), 1);
+    }
+
+    #[test]
+    fn invalidate_server_removes_leader() {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let cluster = build_cluster_arc(&table_path, 1, 1);
+        let metadata = Metadata::new_for_test(cluster);
+        metadata.invalidate_server(&1, vec![1]);
+        let cluster = metadata.get_cluster();
+        assert!(cluster.get_tablet_server(1).is_none());
     }
 }

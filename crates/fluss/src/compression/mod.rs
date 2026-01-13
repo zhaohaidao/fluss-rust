@@ -15,11 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Result;
+mod arrow_compression;
 
-fn main() -> Result<()> {
-    let mut config = prost_build::Config::new();
-    config.bytes([".proto.PbProduceLogReqForBucket.records"]);
-    config.compile_protos(&["src/proto/fluss_api.proto"], &["src/proto"])?;
-    Ok(())
-}
+pub use arrow_compression::*;

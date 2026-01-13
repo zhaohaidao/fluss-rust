@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Result;
+mod compacted_key_writer;
 
-fn main() -> Result<()> {
-    let mut config = prost_build::Config::new();
-    config.bytes([".proto.PbProduceLogReqForBucket.records"]);
-    config.compile_protos(&["src/proto/fluss_api.proto"], &["src/proto"])?;
-    Ok(())
-}
+mod compacted_row;
+mod compacted_row_reader;
+mod compacted_row_writer;
+
+pub use compacted_key_writer::CompactedKeyWriter;
+#[allow(unused_imports)]
+pub use compacted_row::CompactedRow;
+#[allow(unused_imports)]
+pub use compacted_row_reader::{CompactedRowDeserializer, CompactedRowReader};
+#[allow(unused_imports)]
+pub use compacted_row_writer::CompactedRowWriter;

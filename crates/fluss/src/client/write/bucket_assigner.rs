@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::bucketing::BucketingFunction;
 use crate::cluster::Cluster;
+use crate::error::Error::IllegalArgument;
+use crate::error::Result;
 use crate::metadata::TablePath;
 use rand::Rng;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -25,7 +28,7 @@ pub trait BucketAssigner: Sync + Send {
 
     fn on_new_batch(&self, cluster: &Cluster, prev_bucket_id: i32);
 
-    fn assign_bucket(&self, bucket_key: Option<&[u8]>, cluster: &Cluster) -> i32;
+    fn assign_bucket(&self, bucket_key: Option<&[u8]>, cluster: &Cluster) -> Result<i32>;
 }
 
 #[derive(Debug)]
@@ -91,12 +94,95 @@ impl BucketAssigner for StickyBucketAssigner {
         self.next_bucket(cluster, prev_bucket_id);
     }
 
-    fn assign_bucket(&self, _bucket_key: Option<&[u8]>, cluster: &Cluster) -> i32 {
+    fn assign_bucket(&self, _bucket_key: Option<&[u8]>, cluster: &Cluster) -> Result<i32> {
         let bucket_id = self.current_bucket_id.load(Ordering::Relaxed);
         if bucket_id < 0 {
-            self.next_bucket(cluster, bucket_id)
+            Ok(self.next_bucket(cluster, bucket_id))
         } else {
-            bucket_id
+            Ok(bucket_id)
         }
+    }
+}
+
+/// A [BucketAssigner] which assigns based on a modulo hashing function
+pub struct HashBucketAssigner {
+    num_buckets: i32,
+    bucketing_function: Box<dyn BucketingFunction>,
+}
+
+#[allow(dead_code)]
+impl HashBucketAssigner {
+    /// Creates a new [HashBucketAssigner] based on the given [BucketingFunction].
+    /// See [BucketingFunction.of(Option<&DataLakeFormat>)] for bucketing functions.
+    ///
+    ///
+    /// # Arguments
+    /// * `num_buckets` - The number of buckets
+    /// * `bucketing_function` - The bucketing function
+    ///
+    /// # Returns
+    /// * [HashBucketAssigner] - The hash bucket assigner
+    pub fn new(num_buckets: i32, bucketing_function: Box<dyn BucketingFunction>) -> Self {
+        HashBucketAssigner {
+            num_buckets,
+            bucketing_function,
+        }
+    }
+}
+
+impl BucketAssigner for HashBucketAssigner {
+    fn abort_if_batch_full(&self) -> bool {
+        false
+    }
+
+    fn on_new_batch(&self, _: &Cluster, _: i32) {
+        // do nothing
+    }
+
+    fn assign_bucket(&self, bucket_key: Option<&[u8]>, _: &Cluster) -> Result<i32> {
+        let key = bucket_key.ok_or_else(|| IllegalArgument {
+            message: "no bucket key provided".to_string(),
+        })?;
+        self.bucketing_function.bucketing(key, self.num_buckets)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bucketing::BucketingFunction;
+    use crate::cluster::Cluster;
+    use crate::metadata::TablePath;
+    use crate::test_utils::build_cluster;
+
+    #[test]
+    fn sticky_bucket_assigner_picks_available_bucket() {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let cluster = build_cluster(&table_path, 1, 2);
+        let assigner = StickyBucketAssigner::new(table_path);
+        let bucket = assigner.assign_bucket(None, &cluster).expect("bucket");
+        assert!((0..2).contains(&bucket));
+
+        assigner.on_new_batch(&cluster, bucket);
+        let next_bucket = assigner.assign_bucket(None, &cluster).expect("bucket");
+        assert!((0..2).contains(&next_bucket));
+    }
+
+    #[test]
+    fn hash_bucket_assigner_requires_key() {
+        let assigner = HashBucketAssigner::new(3, <dyn BucketingFunction>::of(None));
+        let cluster = Cluster::default();
+        let err = assigner.assign_bucket(None, &cluster).unwrap_err();
+        assert!(matches!(err, crate::error::Error::IllegalArgument { .. }));
+    }
+
+    #[test]
+    fn hash_bucket_assigner_hashes_key() {
+        let assigner = HashBucketAssigner::new(4, <dyn BucketingFunction>::of(None));
+        let cluster = Cluster::default();
+        let bucket = assigner
+            .assign_bucket(Some(b"key"), &cluster)
+            .expect("bucket");
+        assert!((0..4).contains(&bucket));
     }
 }

@@ -18,10 +18,14 @@
 use crate::BucketId;
 use crate::client::broadcast::{BatchWriteResult, BroadcastOnce};
 use crate::client::{ResultHandle, WriteRecord};
+use crate::compression::ArrowCompressionInfo;
 use crate::error::Result;
 use crate::metadata::{DataType, TablePath};
 use crate::record::MemoryLogRecordsArrowBuilder;
+use bytes::Bytes;
+use parking_lot::Mutex;
 use std::cmp::max;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 #[allow(dead_code)]
 pub struct InnerWriteBatch {
@@ -30,7 +34,8 @@ pub struct InnerWriteBatch {
     create_ms: i64,
     bucket_id: BucketId,
     results: BroadcastOnce<BatchWriteResult>,
-    completed: bool,
+    completed: AtomicBool,
+    attempts: AtomicI32,
     drained_ms: i64,
 }
 
@@ -42,7 +47,8 @@ impl InnerWriteBatch {
             create_ms,
             bucket_id,
             results: Default::default(),
-            completed: Default::default(),
+            completed: AtomicBool::new(false),
+            attempts: AtomicI32::new(0),
             drained_ms: -1,
         }
     }
@@ -52,14 +58,35 @@ impl InnerWriteBatch {
     }
 
     fn complete(&self, write_result: BatchWriteResult) -> bool {
-        if !self.completed {
-            self.results.broadcast(write_result);
+        if self
+            .completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
         }
+        self.results.broadcast(write_result);
         true
     }
 
     fn drained(&mut self, now_ms: i64) {
         self.drained_ms = max(self.drained_ms, now_ms);
+    }
+
+    fn table_path(&self) -> &TablePath {
+        &self.table_path
+    }
+
+    fn attempts(&self) -> i32 {
+        self.attempts.load(Ordering::Acquire)
+    }
+
+    fn re_enqueued(&self) {
+        self.attempts.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn is_done(&self) -> bool {
+        self.completed.load(Ordering::Acquire)
     }
 }
 
@@ -111,7 +138,7 @@ impl WriteBatch {
         }
     }
 
-    pub fn build(&self) -> Result<Vec<u8>> {
+    pub fn build(&self) -> Result<Bytes> {
         match self {
             WriteBatch::ArrowLog(batch) => batch.build(),
         }
@@ -124,18 +151,37 @@ impl WriteBatch {
     pub fn batch_id(&self) -> i64 {
         self.inner_batch().batch_id
     }
+
+    pub fn table_path(&self) -> &TablePath {
+        self.inner_batch().table_path()
+    }
+
+    pub fn attempts(&self) -> i32 {
+        self.inner_batch().attempts()
+    }
+
+    pub fn re_enqueued(&self) {
+        self.inner_batch().re_enqueued();
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.inner_batch().is_done()
+    }
 }
 
 pub struct ArrowLogWriteBatch {
     pub write_batch: InnerWriteBatch,
     pub arrow_builder: MemoryLogRecordsArrowBuilder,
+    built_records: Mutex<Option<Bytes>>,
 }
 
 impl ArrowLogWriteBatch {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_id: i64,
         table_path: TablePath,
         schema_id: i32,
+        arrow_compression_info: ArrowCompressionInfo,
         row_type: &DataType,
         bucket_id: BucketId,
         create_ms: i64,
@@ -148,7 +194,9 @@ impl ArrowLogWriteBatch {
                 schema_id,
                 row_type,
                 to_append_record_batch,
+                arrow_compression_info,
             ),
+            built_records: Mutex::new(None),
         }
     }
 
@@ -170,8 +218,14 @@ impl ArrowLogWriteBatch {
         }
     }
 
-    pub fn build(&self) -> Result<Vec<u8>> {
-        self.arrow_builder.build()
+    pub fn build(&self) -> Result<Bytes> {
+        let mut cached = self.built_records.lock();
+        if let Some(bytes) = cached.as_ref() {
+            return Ok(bytes.clone());
+        }
+        let bytes = Bytes::from(self.arrow_builder.build()?);
+        *cached = Some(bytes.clone());
+        Ok(bytes)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -180,5 +234,28 @@ impl ArrowLogWriteBatch {
 
     pub fn close(&mut self) {
         self.arrow_builder.close()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::TablePath;
+
+    #[test]
+    fn complete_only_once() {
+        let batch =
+            InnerWriteBatch::new(1, TablePath::new("db".to_string(), "tbl".to_string()), 0, 0);
+        assert!(batch.complete(Ok(())));
+        assert!(!batch.complete(Err(crate::client::broadcast::Error::Dropped)));
+    }
+
+    #[test]
+    fn attempts_increment_on_reenqueue() {
+        let batch =
+            InnerWriteBatch::new(1, TablePath::new("db".to_string(), "tbl".to_string()), 0, 0);
+        assert_eq!(batch.attempts(), 0);
+        batch.re_enqueued();
+        assert_eq!(batch.attempts(), 1);
     }
 }

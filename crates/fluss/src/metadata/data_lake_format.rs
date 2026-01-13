@@ -15,11 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Result;
-
-fn main() -> Result<()> {
-    let mut config = prost_build::Config::new();
-    config.bytes([".proto.PbProduceLogReqForBucket.records"]);
-    config.compile_protos(&["src/proto/fluss_api.proto"], &["src/proto"])?;
-    Ok(())
+/// Identifies the logical format of a data lake table supported by Fluss.
+///
+/// This enum is typically used in metadata and configuration to distinguish
+/// between different table formats so that the appropriate integration and
+/// semantics can be applied.
+pub enum DataLakeFormat {
+    /// Apache Paimon data lake table format.
+    Paimon,
+    /// Lance columnar data format / lakehouse table format.
+    Lance,
+    /// Apache Iceberg data lake table format.
+    Iceberg,
 }
