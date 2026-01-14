@@ -86,3 +86,55 @@ pub(crate) fn build_cluster_arc(
 ) -> Arc<Cluster> {
     Arc::new(build_cluster(table_path, table_id, buckets))
 }
+
+pub(crate) fn build_cluster_with_coordinator(
+    table_path: &TablePath,
+    table_id: i64,
+    coordinator: ServerNode,
+    tablet: ServerNode,
+) -> Cluster {
+    let table_bucket = TableBucket::new(table_id, 0);
+    let bucket_location =
+        BucketLocation::new(table_bucket.clone(), Some(tablet.clone()), table_path.clone());
+
+    let mut servers = HashMap::new();
+    servers.insert(tablet.id(), tablet);
+
+    let mut locations_by_path = HashMap::new();
+    locations_by_path.insert(table_path.clone(), vec![bucket_location.clone()]);
+
+    let mut locations_by_bucket = HashMap::new();
+    locations_by_bucket.insert(table_bucket, bucket_location);
+
+    let mut table_id_by_path = HashMap::new();
+    table_id_by_path.insert(table_path.clone(), table_id);
+
+    let mut table_info_by_path = HashMap::new();
+    table_info_by_path.insert(
+        table_path.clone(),
+        build_table_info(table_path.clone(), table_id, 1),
+    );
+
+    Cluster::new(
+        Some(coordinator),
+        servers,
+        locations_by_path,
+        locations_by_bucket,
+        table_id_by_path,
+        table_info_by_path,
+    )
+}
+
+pub(crate) fn build_cluster_with_coordinator_arc(
+    table_path: &TablePath,
+    table_id: i64,
+    coordinator: ServerNode,
+    tablet: ServerNode,
+) -> Arc<Cluster> {
+    Arc::new(build_cluster_with_coordinator(
+        table_path,
+        table_id,
+        coordinator,
+        tablet,
+    ))
+}
