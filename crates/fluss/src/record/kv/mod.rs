@@ -15,19 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use strum_macros::{Display, EnumString};
+//! Key-Value record and batch implementations.
 
-/// Identifies the logical format of a data lake table supported by Fluss.
-///
-/// This enum is typically used in metadata and configuration to distinguish
-/// between different table formats so that the appropriate integration and
-/// semantics can be applied.
-#[derive(Debug, EnumString, Display, PartialEq)]
-pub enum DataLakeFormat {
-    /// Apache Paimon data lake table format.
-    Paimon,
-    /// Lance columnar data format / lakehouse table format.
-    Lance,
-    /// Apache Iceberg data lake table format.
-    Iceberg,
-}
+mod kv_record;
+mod kv_record_batch;
+mod kv_record_batch_builder;
+
+pub use kv_record::{KvRecord, LENGTH_LENGTH as KV_RECORD_LENGTH_LENGTH};
+pub use kv_record_batch::*;
+pub use kv_record_batch_builder::*;
+
+/// Current KV magic value
+pub const CURRENT_KV_MAGIC_VALUE: u8 = 0;
+
+/// No writer ID constant
+pub const NO_WRITER_ID: i64 = -1;
+
+/// No batch sequence constant
+pub const NO_BATCH_SEQUENCE: i32 = -1;
