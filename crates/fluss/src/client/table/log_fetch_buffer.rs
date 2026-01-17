@@ -661,8 +661,8 @@ mod tests {
     use arrow::array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashSet;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn test_read_context() -> ReadContext {
@@ -778,7 +778,6 @@ mod tests {
             self.next_fetch_offset
         }
     }
-
     #[tokio::test]
     async fn await_not_empty_returns_wakeup_error() {
         let buffer = LogFetchBuffer::new(test_read_context());
