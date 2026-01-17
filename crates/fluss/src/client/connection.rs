@@ -109,14 +109,16 @@ mod tests {
     use super::*;
     use crate::cluster::{Cluster, ServerNode, ServerType};
     use crate::metadata::{DataField, DataTypes, Schema, TableDescriptor, TableInfo, TablePath};
-    use crate::rpc::ServerConnection;
+    use crate::test_utils::build_mock_connection;
     use std::collections::HashMap;
-    use tokio::io::BufStream;
-    use tokio::task::JoinHandle;
 
     fn build_cluster() -> Arc<Cluster> {
-        let coordinator =
-            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::CoordinatorServer);
+        let coordinator = ServerNode::new(
+            1,
+            "127.0.0.1".to_string(),
+            9092,
+            ServerType::CoordinatorServer,
+        );
 
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let row_type = DataTypes::row(vec![DataField::new(
@@ -147,21 +149,6 @@ mod tests {
             table_id_by_path,
             table_info_by_path,
         ))
-    }
-
-    async fn build_mock_connection<F>(handler: F) -> (ServerConnection, JoinHandle<()>)
-    where
-        F: FnMut(crate::rpc::ApiKey, i32, Vec<u8>) -> Vec<u8> + Send + 'static,
-    {
-        let (client, server) = tokio::io::duplex(1024);
-        let handle = crate::rpc::spawn_mock_server(server, handler).await;
-        let transport = crate::rpc::Transport::Test { inner: client };
-        let connection = Arc::new(crate::rpc::ServerConnectionInner::new(
-            BufStream::new(transport),
-            usize::MAX,
-            Arc::from(""),
-        ));
-        (connection, handle)
     }
 
     #[tokio::test]
@@ -209,7 +196,10 @@ mod tests {
             writer_client: Default::default(),
         };
 
-        assert_eq!(connection.config().request_max_size, config.request_max_size);
+        assert_eq!(
+            connection.config().request_max_size,
+            config.request_max_size
+        );
         assert!(Arc::ptr_eq(&connection.get_metadata(), &metadata));
         assert!(Arc::ptr_eq(&connection.get_connections(), &rpc_client));
     }

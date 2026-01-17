@@ -25,9 +25,13 @@ use tokio::net::TcpStream;
 
 #[derive(Debug)]
 pub enum Transport {
-    Plain { inner: TcpStream },
+    Plain {
+        inner: TcpStream,
+    },
     #[cfg(test)]
-    Test { inner: tokio::io::DuplexStream },
+    Test {
+        inner: tokio::io::DuplexStream,
+    },
 }
 
 impl AsyncRead for Transport {

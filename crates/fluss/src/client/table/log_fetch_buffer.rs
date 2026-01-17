@@ -647,18 +647,19 @@ impl CompletedFetch for DefaultCompletedFetch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use arrow_schema::{DataType, Field, Schema};
     use crate::client::WriteRecord;
     use crate::compression::{
         ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
     };
     use crate::metadata::{DataField, DataTypes, TablePath};
     use crate::record::{
-        LENGTH_LENGTH, LENGTH_OFFSET, LOG_OVERHEAD, MemoryLogRecordsArrowBuilder, ReadContext,
-        RECORDS_COUNT_LENGTH, RECORDS_COUNT_OFFSET, RECORDS_OFFSET, ScanRecord, to_arrow_schema,
+        LENGTH_LENGTH, LENGTH_OFFSET, LOG_OVERHEAD, MemoryLogRecordsArrowBuilder,
+        RECORDS_COUNT_LENGTH, RECORDS_COUNT_OFFSET, RECORDS_OFFSET, ReadContext, ScanRecord,
+        to_arrow_schema,
     };
     use crate::row::{ColumnarRow, GenericRow};
+    use arrow::array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashSet;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -674,11 +675,7 @@ mod tests {
     }
 
     fn test_scan_record() -> ScanRecord {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
             .expect("record batch");
         let row = ColumnarRow::new(Arc::new(batch));
@@ -817,9 +814,7 @@ mod tests {
         buffer.pend(Box::new(ErrorPendingFetch {
             table_bucket: bucket_pending.clone(),
         }));
-        buffer.set_next_in_line_fetch(Some(Box::new(TestCompletedFetch::new(
-            bucket_next.clone(),
-        ))));
+        buffer.set_next_in_line_fetch(Some(Box::new(TestCompletedFetch::new(bucket_next.clone()))));
         buffer.add(Box::new(TestCompletedFetch::new(bucket_completed.clone())));
 
         let buckets: HashSet<TableBucket> = buffer.buffered_buckets().into_iter().collect();
@@ -837,12 +832,7 @@ mod tests {
         }));
         buffer.add(Box::new(TestCompletedFetch::new(TableBucket::new(1, 1))));
 
-        let pending: HashSet<TableBucket> = buffer
-            .pending_fetches
-            .lock()
-            .keys()
-            .cloned()
-            .collect();
+        let pending: HashSet<TableBucket> = buffer.pending_fetches.lock().keys().cloned().collect();
         assert_eq!(pending, HashSet::from([bucket_pending]));
     }
 

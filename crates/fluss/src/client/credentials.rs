@@ -163,27 +163,10 @@ mod tests {
     use crate::client::metadata::Metadata;
     use crate::cluster::{Cluster, ServerNode, ServerType};
     use crate::proto::{GetFileSystemSecurityTokenResponse, PbKeyValue};
-    use crate::rpc::ServerConnection;
+    use crate::test_utils::build_mock_connection;
     use prost::Message;
-    use tokio::io::BufStream;
-    use tokio::task::JoinHandle;
 
     const API_GET_SECURITY_TOKEN: i16 = 1025;
-
-    async fn build_mock_connection<F>(handler: F) -> (ServerConnection, JoinHandle<()>)
-    where
-        F: FnMut(crate::rpc::ApiKey, i32, Vec<u8>) -> Vec<u8> + Send + 'static,
-    {
-        let (client, server) = tokio::io::duplex(1024);
-        let handle = crate::rpc::spawn_mock_server(server, handler).await;
-        let transport = crate::rpc::Transport::Test { inner: client };
-        let connection = Arc::new(crate::rpc::ServerConnectionInner::new(
-            BufStream::new(transport),
-            usize::MAX,
-            Arc::from(""),
-        ));
-        (connection, handle)
-    }
 
     fn build_cluster(server: ServerNode) -> Arc<Cluster> {
         Arc::new(Cluster::new(
@@ -243,23 +226,27 @@ mod tests {
     #[tokio::test]
     async fn refresh_from_server_returns_empty_when_token_missing() -> Result<()> {
         let (connection, handle) =
-            build_mock_connection(|api_key: crate::rpc::ApiKey, _, _| match i16::from(api_key) {
-                API_GET_SECURITY_TOKEN => GetFileSystemSecurityTokenResponse {
-                    schema: "s3".to_string(),
-                    token: Vec::new(),
-                    expiration_time: None,
-                    addition_info: vec![],
-                }
-                .encode_to_vec(),
-                _ => vec![],
-            })
+            build_mock_connection(
+                |api_key: crate::rpc::ApiKey, _, _| match i16::from(api_key) {
+                    API_GET_SECURITY_TOKEN => GetFileSystemSecurityTokenResponse {
+                        schema: "s3".to_string(),
+                        token: Vec::new(),
+                        expiration_time: None,
+                        addition_info: vec![],
+                    }
+                    .encode_to_vec(),
+                    _ => vec![],
+                },
+            )
             .await;
 
         let server = ServerNode::new(1, "127.0.0.1".to_string(), 9999, ServerType::TabletServer);
         let rpc_client = Arc::new(RpcClient::new());
         rpc_client.insert_connection_for_test(&server, connection);
-        let cache =
-            CredentialsCache::new(rpc_client, Arc::new(Metadata::new_for_test(build_cluster(server))));
+        let cache = CredentialsCache::new(
+            rpc_client,
+            Arc::new(Metadata::new_for_test(build_cluster(server))),
+        );
 
         let props = cache.get_or_refresh().await?;
         assert!(props.is_empty());
@@ -276,26 +263,30 @@ mod tests {
         });
         let token_bytes = serde_json::to_vec(&token_json).unwrap();
         let (connection, handle) =
-            build_mock_connection(move |api_key: crate::rpc::ApiKey, _, _| match i16::from(api_key) {
-                API_GET_SECURITY_TOKEN => GetFileSystemSecurityTokenResponse {
-                    schema: "s3".to_string(),
-                    token: token_bytes.clone(),
-                    expiration_time: Some(100),
-                    addition_info: vec![PbKeyValue {
-                        key: "fs.s3a.endpoint".to_string(),
-                        value: "localhost".to_string(),
-                    }],
+            build_mock_connection(move |api_key: crate::rpc::ApiKey, _, _| {
+                match i16::from(api_key) {
+                    API_GET_SECURITY_TOKEN => GetFileSystemSecurityTokenResponse {
+                        schema: "s3".to_string(),
+                        token: token_bytes.clone(),
+                        expiration_time: Some(100),
+                        addition_info: vec![PbKeyValue {
+                            key: "fs.s3a.endpoint".to_string(),
+                            value: "localhost".to_string(),
+                        }],
+                    }
+                    .encode_to_vec(),
+                    _ => vec![],
                 }
-                .encode_to_vec(),
-                _ => vec![],
             })
             .await;
 
         let server = ServerNode::new(1, "127.0.0.1".to_string(), 9999, ServerType::TabletServer);
         let rpc_client = Arc::new(RpcClient::new());
         rpc_client.insert_connection_for_test(&server, connection);
-        let cache =
-            CredentialsCache::new(rpc_client, Arc::new(Metadata::new_for_test(build_cluster(server))));
+        let cache = CredentialsCache::new(
+            rpc_client,
+            Arc::new(Metadata::new_for_test(build_cluster(server))),
+        );
 
         let props = cache.get_or_refresh().await?;
         assert_eq!(props.get("access_key_id"), Some(&"ak".to_string()));

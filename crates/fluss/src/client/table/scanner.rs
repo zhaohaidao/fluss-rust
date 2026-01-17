@@ -1425,8 +1425,6 @@ impl BucketScanStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use arrow_schema::{DataType, Field, Schema};
     use crate::client::FlussConnection;
     use crate::client::WriteRecord;
     use crate::client::metadata::Metadata;
@@ -1440,13 +1438,13 @@ mod tests {
     use crate::record::MemoryLogRecordsArrowBuilder;
     use crate::row::{ColumnarRow, Datum, GenericRow};
     use crate::rpc::FlussError;
-    use crate::rpc::ServerConnection;
-    use crate::test_utils::{build_cluster_arc, build_table_info};
+    use crate::test_utils::{build_cluster_arc, build_mock_connection, build_table_info};
+    use arrow::array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
     use prost::Message;
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::io::BufStream;
-    use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
     fn build_records(table_info: &TableInfo, table_path: Arc<TablePath>) -> Result<Vec<u8>> {
@@ -1470,11 +1468,7 @@ mod tests {
     }
 
     fn test_scan_record() -> ScanRecord {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            DataType::Int32,
-            false,
-        )]));
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
             .expect("record batch");
         let row = ColumnarRow::new(Arc::new(batch));
@@ -1523,14 +1517,9 @@ mod tests {
         }
 
         fn batch_ok(table_bucket: TableBucket) -> Self {
-            let schema = Arc::new(Schema::new(vec![Field::new(
-                "id",
-                DataType::Int32,
-                false,
-            )]));
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
-                    .expect("record batch");
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])
+                .expect("record batch");
             Self {
                 table_bucket,
                 records: Vec::new(),
@@ -1649,21 +1638,6 @@ mod tests {
         }
     }
 
-    async fn build_mock_connection<F>(handler: F) -> (ServerConnection, JoinHandle<()>)
-    where
-        F: FnMut(crate::rpc::ApiKey, i32, Vec<u8>) -> Vec<u8> + Send + 'static,
-    {
-        let (client, server) = tokio::io::duplex(1024);
-        let handle = crate::rpc::spawn_mock_server(server, handler).await;
-        let transport = crate::rpc::Transport::Test { inner: client };
-        let connection = Arc::new(crate::rpc::ServerConnectionInner::new(
-            BufStream::new(transport),
-            usize::MAX,
-            Arc::from(""),
-        ));
-        (connection, handle)
-    }
-
     fn build_cluster_with_leader(
         table_info: &TableInfo,
         leader: Option<ServerNode>,
@@ -1678,10 +1652,13 @@ mod tests {
         }
         let location =
             BucketLocation::new(table_bucket.clone(), leader, table_info.table_path.clone());
-        let locations_by_path = HashMap::from([(table_info.table_path.clone(), vec![location.clone()])]);
+        let locations_by_path =
+            HashMap::from([(table_info.table_path.clone(), vec![location.clone()])]);
         let locations_by_bucket = HashMap::from([(table_bucket, location)]);
-        let table_id_by_path = HashMap::from([(table_info.table_path.clone(), table_info.table_id)]);
-        let table_info_by_path = HashMap::from([(table_info.table_path.clone(), table_info.clone())]);
+        let table_id_by_path =
+            HashMap::from([(table_info.table_path.clone(), table_info.table_id)]);
+        let table_info_by_path =
+            HashMap::from([(table_info.table_path.clone(), table_info.clone())]);
         Arc::new(Cluster::new(
             None,
             servers,
@@ -2056,7 +2033,10 @@ mod tests {
 
     #[tokio::test]
     async fn collect_fetches_returns_error_for_corrupt_or_unexpected() -> Result<()> {
-        let error_cases = [FlussError::CorruptMessage, FlussError::InvalidTableException];
+        let error_cases = [
+            FlussError::CorruptMessage,
+            FlussError::InvalidTableException,
+        ];
 
         for error in error_cases {
             let result = collect_result_for_error(error).await?;
@@ -2072,8 +2052,7 @@ mod tests {
     async fn send_fetches_invalidates_missing_server() -> Result<()> {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let table_info = build_table_info(table_path.clone(), 1, 1);
-        let leader =
-            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let leader = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
         let cluster = build_cluster_with_leader(&table_info, Some(leader), false);
         let metadata = Arc::new(Metadata::new_for_test(cluster));
         let status = Arc::new(LogScannerStatus::new());
@@ -2096,8 +2075,7 @@ mod tests {
     async fn send_fetches_invalidates_on_request_error() -> Result<()> {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let table_info = build_table_info(table_path.clone(), 1, 1);
-        let leader =
-            ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
+        let leader = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
         let cluster = build_cluster_with_leader(&table_info, Some(leader.clone()), true);
         let metadata = Arc::new(Metadata::new_for_test(cluster));
         let status = Arc::new(LogScannerStatus::new());
@@ -2115,13 +2093,7 @@ mod tests {
         ));
         rpc_client.insert_connection_for_test(&leader, connection);
 
-        let fetcher = LogFetcher::new(
-            table_info,
-            rpc_client,
-            metadata.clone(),
-            status,
-            None,
-        )?;
+        let fetcher = LogFetcher::new(table_info, rpc_client, metadata.clone(), status, None)?;
         fetcher.send_fetches().await?;
         wait_for_leader_removal(&metadata, &bucket).await?;
         Ok(())
@@ -2131,8 +2103,7 @@ mod tests {
     async fn send_fetches_invalidates_on_connection_error() -> Result<()> {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
         let table_info = build_table_info(table_path.clone(), 1, 1);
-        let leader =
-            ServerNode::new(1, "127.0.0.1".to_string(), 1, ServerType::TabletServer);
+        let leader = ServerNode::new(1, "127.0.0.1".to_string(), 1, ServerType::TabletServer);
         let cluster = build_cluster_with_leader(&table_info, Some(leader.clone()), true);
         let metadata = Arc::new(Metadata::new_for_test(cluster));
         let status = Arc::new(LogScannerStatus::new());
@@ -2240,13 +2211,7 @@ mod tests {
             .clone();
         rpc_client.insert_connection_for_test(&server_node, connection);
 
-        let fetcher = LogFetcher::new(
-            table_info,
-            rpc_client,
-            metadata,
-            status.clone(),
-            None,
-        )?;
+        let fetcher = LogFetcher::new(table_info, rpc_client, metadata, status.clone(), None)?;
 
         fetcher.send_fetches().await?;
         let has_data = fetcher
@@ -2564,12 +2529,7 @@ mod tests {
         let table_info = build_table_info(table_path.clone(), 1, 1);
         let cluster = build_cluster_arc(&table_path, 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let inner = LogScannerInner::new(
-            &table_info,
-            metadata,
-            Arc::new(RpcClient::new()),
-            None,
-        )?;
+        let inner = LogScannerInner::new(&table_info, metadata, Arc::new(RpcClient::new()), None)?;
 
         let result = inner.subscribe_batch(&HashMap::new()).await;
         assert!(matches!(result, Err(Error::UnexpectedError { .. })));
@@ -2703,12 +2663,7 @@ mod tests {
         let table_info = build_table_info(table_path.clone(), 1, 1);
         let cluster = build_cluster_arc(&table_path, 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let inner = LogScannerInner::new(
-            &table_info,
-            metadata,
-            Arc::new(RpcClient::new()),
-            None,
-        )?;
+        let inner = LogScannerInner::new(&table_info, metadata, Arc::new(RpcClient::new()), None)?;
         let scanner = LogScanner {
             inner: Arc::new(inner),
         };
@@ -2724,12 +2679,7 @@ mod tests {
         let table_info = build_table_info(table_path.clone(), 1, 1);
         let cluster = build_cluster_arc(&table_path, 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let inner = LogScannerInner::new(
-            &table_info,
-            metadata,
-            Arc::new(RpcClient::new()),
-            None,
-        )?;
+        let inner = LogScannerInner::new(&table_info, metadata, Arc::new(RpcClient::new()), None)?;
 
         inner.log_fetcher.log_fetch_buffer.wakeup();
         let result = inner.poll_records(Duration::from_millis(10)).await;
@@ -2743,12 +2693,7 @@ mod tests {
         let table_info = build_table_info(table_path.clone(), 1, 1);
         let cluster = build_cluster_arc(&table_path, 1, 1);
         let metadata = Arc::new(Metadata::new_for_test(cluster));
-        let inner = LogScannerInner::new(
-            &table_info,
-            metadata,
-            Arc::new(RpcClient::new()),
-            None,
-        )?;
+        let inner = LogScannerInner::new(&table_info, metadata, Arc::new(RpcClient::new()), None)?;
 
         inner.log_fetcher.log_fetch_buffer.wakeup();
         let result = inner.poll_batches(Duration::from_millis(10)).await;

@@ -1062,9 +1062,9 @@ mod tests {
     use crate::compression::{
         ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
     };
+    use crate::error::Error;
     use crate::metadata::{DataField, DataTypes, TablePath};
     use crate::row::{Datum, GenericRow};
-    use crate::error::Error;
     use arrow::array::Int32Array;
     use bytes::Bytes;
     use std::sync::Arc;

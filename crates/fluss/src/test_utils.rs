@@ -19,8 +19,26 @@ use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
 use crate::metadata::{
     DataField, DataTypes, Schema, TableBucket, TableDescriptor, TableInfo, TablePath,
 };
+use crate::rpc::{ServerConnection, ServerConnectionInner, Transport, spawn_mock_server};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::BufStream;
+use tokio::task::JoinHandle;
+
+pub(crate) async fn build_mock_connection<F>(handler: F) -> (ServerConnection, JoinHandle<()>)
+where
+    F: FnMut(crate::rpc::ApiKey, i32, Vec<u8>) -> Vec<u8> + Send + 'static,
+{
+    let (client, server) = tokio::io::duplex(1024);
+    let handle = spawn_mock_server(server, handler).await;
+    let transport = Transport::Test { inner: client };
+    let connection = Arc::new(ServerConnectionInner::new(
+        BufStream::new(transport),
+        usize::MAX,
+        Arc::from(""),
+    ));
+    (connection, handle)
+}
 
 pub(crate) fn build_table_info(table_path: TablePath, table_id: i64, buckets: i32) -> TableInfo {
     let row_type = DataTypes::row(vec![DataField::new(
@@ -94,8 +112,11 @@ pub(crate) fn build_cluster_with_coordinator(
     tablet: ServerNode,
 ) -> Cluster {
     let table_bucket = TableBucket::new(table_id, 0);
-    let bucket_location =
-        BucketLocation::new(table_bucket.clone(), Some(tablet.clone()), table_path.clone());
+    let bucket_location = BucketLocation::new(
+        table_bucket.clone(),
+        Some(tablet.clone()),
+        table_path.clone(),
+    );
 
     let mut servers = HashMap::new();
     servers.insert(tablet.id(), tablet);

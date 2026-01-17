@@ -21,12 +21,12 @@ use crate::rpc::api_version::ApiVersion;
 use crate::rpc::error::RpcError;
 use crate::rpc::error::RpcError::ConnectionError;
 use crate::rpc::frame::{AsyncMessageRead, AsyncMessageWrite};
-#[cfg(test)]
-use bytes::Buf;
 use crate::rpc::message::{
     ReadVersionedType, RequestBody, RequestHeader, ResponseHeader, WriteVersionedType,
 };
 use crate::rpc::transport::Transport;
+#[cfg(test)]
+use bytes::Buf;
 use futures::future::BoxFuture;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;

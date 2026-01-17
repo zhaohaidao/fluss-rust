@@ -338,11 +338,9 @@ mod tests {
         GetTableInfoResponse, ListDatabasesResponse, ListOffsetsResponse, ListTablesResponse,
         PbLakeSnapshotForBucket, PbListOffsetsRespForBucket, TableExistsResponse,
     };
+    use crate::test_utils::{build_cluster_with_coordinator_arc, build_mock_connection};
     use prost::Message;
     use std::sync::Arc;
-    use crate::test_utils::build_cluster_with_coordinator_arc;
-    use tokio::io::BufStream;
-    use tokio::task::JoinHandle;
 
     const API_CREATE_DATABASE: i16 = 1001;
     const API_DROP_DATABASE: i16 = 1002;
@@ -356,21 +354,6 @@ mod tests {
     const API_LIST_OFFSETS: i16 = 1021;
     const API_GET_LAKE_SNAPSHOT: i16 = 1032;
     const API_GET_DATABASE_INFO: i16 = 1035;
-
-    async fn build_mock_connection<F>(handler: F) -> (ServerConnection, JoinHandle<()>)
-    where
-        F: FnMut(crate::rpc::ApiKey, i32, Vec<u8>) -> Vec<u8> + Send + 'static,
-    {
-        let (client, server) = tokio::io::duplex(1024);
-        let handle = crate::rpc::spawn_mock_server(server, handler).await;
-        let transport = crate::rpc::Transport::Test { inner: client };
-        let connection = Arc::new(crate::rpc::ServerConnectionInner::new(
-            BufStream::new(transport),
-            usize::MAX,
-            Arc::from(""),
-        ));
-        (connection, handle)
-    }
 
     fn build_table_descriptor() -> TableDescriptor {
         let row_type = DataTypes::row(vec![
@@ -447,29 +430,35 @@ mod tests {
             })
             .await;
 
-        let (tablet_connection, tablet_handle) =
-            build_mock_connection(|api_key: crate::rpc::ApiKey, _, _| {
-                match i16::from(api_key) {
-                    API_LIST_OFFSETS => ListOffsetsResponse {
-                        buckets_resp: vec![PbListOffsetsRespForBucket {
-                            bucket_id: 0,
-                            error_code: None,
-                            error_message: None,
-                            offset: Some(7),
-                        }],
-                    }
-                    .encode_to_vec(),
-                    _ => vec![],
+        let (tablet_connection, tablet_handle) = build_mock_connection(
+            |api_key: crate::rpc::ApiKey, _, _| match i16::from(api_key) {
+                API_LIST_OFFSETS => ListOffsetsResponse {
+                    buckets_resp: vec![PbListOffsetsRespForBucket {
+                        bucket_id: 0,
+                        error_code: None,
+                        error_message: None,
+                        offset: Some(7),
+                    }],
                 }
-            })
-            .await;
+                .encode_to_vec(),
+                _ => vec![],
+            },
+        )
+        .await;
 
-        let coordinator =
-            ServerNode::new(100, "127.0.0.1".to_string(), 9999, ServerType::CoordinatorServer);
-        let tablet =
-            ServerNode::new(1, "127.0.0.1".to_string(), 9998, ServerType::TabletServer);
-        let cluster =
-            build_cluster_with_coordinator_arc(&table_path, table_id, coordinator.clone(), tablet.clone());
+        let coordinator = ServerNode::new(
+            100,
+            "127.0.0.1".to_string(),
+            9999,
+            ServerType::CoordinatorServer,
+        );
+        let tablet = ServerNode::new(1, "127.0.0.1".to_string(), 9998, ServerType::TabletServer);
+        let cluster = build_cluster_with_coordinator_arc(
+            &table_path,
+            table_id,
+            coordinator.clone(),
+            tablet.clone(),
+        );
         let metadata = Arc::new(Metadata::new_for_test(cluster));
         let rpc_client = Arc::new(RpcClient::new());
         rpc_client.insert_connection_for_test(&coordinator, admin_connection);
@@ -506,7 +495,9 @@ mod tests {
         let snapshot = admin.get_latest_lake_snapshot(&table_path).await?;
         assert_eq!(snapshot.snapshot_id(), 99);
         assert_eq!(
-            snapshot.table_buckets_offset().get(&TableBucket::new(table_id, 0)),
+            snapshot
+                .table_buckets_offset()
+                .get(&TableBucket::new(table_id, 0)),
             Some(&123)
         );
 
@@ -523,14 +514,19 @@ mod tests {
     #[tokio::test]
     async fn list_offsets_empty_buckets_error() -> Result<()> {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
-        let (admin_connection, admin_handle) =
-            build_mock_connection(|api_key: crate::rpc::ApiKey, _, _| match i16::from(api_key) {
+        let (admin_connection, admin_handle) = build_mock_connection(
+            |api_key: crate::rpc::ApiKey, _, _| match i16::from(api_key) {
                 API_CREATE_DATABASE => CreateDatabaseResponse::default().encode_to_vec(),
                 _ => vec![],
-            })
-            .await;
-        let coordinator =
-            ServerNode::new(10, "127.0.0.1".to_string(), 9999, ServerType::CoordinatorServer);
+            },
+        )
+        .await;
+        let coordinator = ServerNode::new(
+            10,
+            "127.0.0.1".to_string(),
+            9999,
+            ServerType::CoordinatorServer,
+        );
         let tablet = ServerNode::new(11, "127.0.0.1".to_string(), 8081, ServerType::TabletServer);
         let cluster = build_cluster_with_coordinator_arc(&table_path, 1, coordinator, tablet);
         let metadata = Arc::new(Metadata::new_for_test(cluster));

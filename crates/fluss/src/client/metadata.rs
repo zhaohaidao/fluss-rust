@@ -157,16 +157,15 @@ mod tests {
     use super::*;
     use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
     use crate::metadata::{
-        DataField, DataTypes, JsonSerde, Schema, TableBucket, TableInfo, TablePath,
-        TableDescriptor,
+        DataField, DataTypes, JsonSerde, Schema, TableBucket, TableDescriptor, TableInfo, TablePath,
     };
-    use crate::proto::{MetadataResponse, PbBucketMetadata, PbServerNode, PbTableMetadata, PbTablePath};
-    use crate::rpc::ServerConnection;
+    use crate::proto::{
+        MetadataResponse, PbBucketMetadata, PbServerNode, PbTableMetadata, PbTablePath,
+    };
+    use crate::test_utils::build_mock_connection;
     use prost::Message;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
-    use tokio::io::BufStream;
-    use tokio::task::JoinHandle;
 
     const API_UPDATE_METADATA: i16 = 1012;
 
@@ -189,8 +188,11 @@ mod tests {
     fn build_cluster(table_path: &TablePath, table_id: i64) -> Arc<Cluster> {
         let server = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
         let table_bucket = TableBucket::new(table_id, 0);
-        let bucket_location =
-            BucketLocation::new(table_bucket.clone(), Some(server.clone()), table_path.clone());
+        let bucket_location = BucketLocation::new(
+            table_bucket.clone(),
+            Some(server.clone()),
+            table_path.clone(),
+        );
 
         let mut servers = HashMap::new();
         servers.insert(server.id(), server);
@@ -205,7 +207,10 @@ mod tests {
         table_id_by_path.insert(table_path.clone(), table_id);
 
         let mut table_info_by_path = HashMap::new();
-        table_info_by_path.insert(table_path.clone(), build_table_info(table_path.clone(), table_id));
+        table_info_by_path.insert(
+            table_path.clone(),
+            build_table_info(table_path.clone(), table_id),
+        );
 
         Arc::new(Cluster::new(
             None,
@@ -277,27 +282,6 @@ mod tests {
         }
     }
 
-    async fn build_mock_connection(
-        response: MetadataResponse,
-    ) -> (ServerConnection, JoinHandle<()>) {
-        let response_bytes = response.encode_to_vec();
-        let (client, server) = tokio::io::duplex(1024);
-        let handle = crate::rpc::spawn_mock_server(server, move |api_key, _, _| {
-            match i16::from(api_key) {
-                API_UPDATE_METADATA => response_bytes.clone(),
-                _ => vec![],
-            }
-        })
-        .await;
-        let transport = crate::rpc::Transport::Test { inner: client };
-        let connection = Arc::new(crate::rpc::ServerConnectionInner::new(
-            BufStream::new(transport),
-            usize::MAX,
-            Arc::from(""),
-        ));
-        (connection, handle)
-    }
-
     #[test]
     fn leader_for_returns_server() {
         let table_path = TablePath::new("db".to_string(), "tbl".to_string());
@@ -352,7 +336,13 @@ mod tests {
         let server = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
         let metadata = Metadata::new_for_test(build_cluster_with_server(server.clone()));
         let response = build_metadata_response(&table_path, 1);
-        let (connection, handle) = build_mock_connection(response).await;
+        let response_bytes = response.encode_to_vec();
+        let (connection, handle) =
+            build_mock_connection(move |api_key, _, _| match i16::from(api_key) {
+                API_UPDATE_METADATA => response_bytes.clone(),
+                _ => vec![],
+            })
+            .await;
         metadata
             .connections
             .insert_connection_for_test(&server, connection);
@@ -371,7 +361,13 @@ mod tests {
         let server = ServerNode::new(1, "127.0.0.1".to_string(), 9092, ServerType::TabletServer);
         let metadata = Metadata::new_for_test(build_cluster_with_server(server.clone()));
         let response = build_metadata_response(&table_path, 1);
-        let (connection, handle) = build_mock_connection(response).await;
+        let response_bytes = response.encode_to_vec();
+        let (connection, handle) =
+            build_mock_connection(move |api_key, _, _| match i16::from(api_key) {
+                API_UPDATE_METADATA => response_bytes.clone(),
+                _ => vec![],
+            })
+            .await;
         metadata
             .connections
             .insert_connection_for_test(&server, connection);
