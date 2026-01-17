@@ -15,9 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::metadata::DataType;
+use crate::metadata::{DataType, RowType};
 use crate::row::{Datum, InternalRow};
 
+#[derive(Clone)]
 pub enum FieldGetter {
     Nullable(InnerFieldGetter),
     NonNullable(InnerFieldGetter),
@@ -34,6 +35,16 @@ impl FieldGetter {
             }
             FieldGetter::NonNullable(getter) => getter.get_field(row),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn create_field_getters(row_type: &RowType) -> Box<[FieldGetter]> {
+        row_type
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(pos, field)| Self::create(field.data_type(), pos))
+            .collect()
     }
 
     pub fn create(data_type: &DataType, pos: usize) -> FieldGetter {
@@ -66,6 +77,7 @@ impl FieldGetter {
     }
 }
 
+#[derive(Clone)]
 pub enum InnerFieldGetter {
     Char { pos: usize, len: usize },
     String { pos: usize },
@@ -83,7 +95,7 @@ pub enum InnerFieldGetter {
 impl InnerFieldGetter {
     pub fn get_field<'a>(&self, row: &'a dyn InternalRow) -> Datum<'a> {
         match self {
-            InnerFieldGetter::Char { pos, len } => Datum::String(row.get_char(*pos, *len)),
+            InnerFieldGetter::Char { pos, len } => Datum::from(row.get_char(*pos, *len)),
             InnerFieldGetter::String { pos } => Datum::from(row.get_string(*pos)),
             InnerFieldGetter::Bool { pos } => Datum::from(row.get_boolean(*pos)),
             InnerFieldGetter::Binary { pos, len } => Datum::from(row.get_binary(*pos, *len)),
