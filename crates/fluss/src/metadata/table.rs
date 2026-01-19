@@ -18,11 +18,13 @@
 use crate::compression::ArrowCompressionInfo;
 use crate::error::Error::InvalidTableError;
 use crate::error::{Error, Result};
+use crate::metadata::DataLakeFormat;
 use crate::metadata::datatype::{DataField, DataType, RowType};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+use strum_macros::EnumString;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Column {
@@ -603,7 +605,7 @@ impl LogFormat {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, EnumString)]
 pub enum KvFormat {
     INDEXED,
     COMPACTED,
@@ -725,6 +727,25 @@ impl TableConfig {
 
     pub fn get_arrow_compression_info(&self) -> Result<ArrowCompressionInfo> {
         ArrowCompressionInfo::from_conf(&self.properties)
+    }
+
+    /// Returns the data lake format if configured, or None if not set.
+    pub fn get_datalake_format(&self) -> Result<Option<DataLakeFormat>> {
+        self.properties
+            .get("table.datalake.format")
+            .map(|f| f.parse().map_err(Error::from))
+            .transpose()
+    }
+
+    pub fn get_kv_format(&self) -> Result<KvFormat> {
+        // TODO: Consolidate configurations logic, constants, defaults in a single place
+        const DEFAULT_KV_FORMAT: &str = "COMPACTED";
+        let kv_format = self
+            .properties
+            .get("table.kv.format")
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_KV_FORMAT);
+        kv_format.parse().map_err(Into::into)
     }
 }
 
@@ -1014,5 +1035,210 @@ impl LakeSnapshot {
 
     pub fn table_buckets_offset(&self) -> &HashMap<TableBucket, i64> {
         &self.table_buckets_offset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::DataTypes;
+
+    #[test]
+    fn schema_builder_rejects_duplicate_columns() {
+        let result = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("id", DataTypes::string())
+            .build();
+        assert!(matches!(result, Err(Error::InvalidTableError { .. })));
+    }
+
+    #[test]
+    fn primary_key_columns_become_non_nullable() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .expect("schema");
+
+        let id_col = schema.columns().iter().find(|c| c.name() == "id").unwrap();
+        assert!(!id_col.data_type().is_nullable());
+    }
+
+    #[test]
+    fn table_descriptor_defaults_bucket_keys_for_primary_key() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("p", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .expect("schema");
+
+        let descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .partitioned_by(vec!["p".to_string()])
+            .build()
+            .expect("descriptor");
+
+        assert_eq!(descriptor.bucket_keys(), vec!["id"]);
+        assert!(descriptor.has_primary_key());
+    }
+
+    #[test]
+    fn table_descriptor_rejects_bucket_keys_with_partition() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("p", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .expect("schema");
+
+        let result = TableDescriptor::builder()
+            .schema(schema)
+            .partitioned_by(vec!["p".to_string()])
+            .distributed_by(Some(1), vec!["p".to_string()])
+            .build();
+        assert!(matches!(result, Err(Error::InvalidTableError { .. })));
+    }
+
+    #[test]
+    fn replication_factor_errors_on_missing_or_invalid() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .build()
+            .expect("schema");
+        let descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(1), vec![])
+            .build()
+            .expect("descriptor");
+
+        assert!(descriptor.replication_factor().is_err());
+
+        let mut props = HashMap::new();
+        props.insert("table.replication.factor".to_string(), "oops".to_string());
+        let descriptor = descriptor.with_properties(props);
+        assert!(descriptor.replication_factor().is_err());
+    }
+
+    #[test]
+    fn table_info_round_trip_descriptor() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .expect("schema");
+        let descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(3), vec![])
+            .comment("tbl")
+            .build()
+            .expect("descriptor");
+
+        let info = TableInfo::of(
+            TablePath::new("db".to_string(), "tbl".to_string()),
+            10,
+            1,
+            descriptor.clone(),
+            0,
+            0,
+        );
+        let round_trip = info.to_table_descriptor().expect("descriptor");
+        assert_eq!(
+            round_trip.bucket_keys(),
+            info.bucket_keys
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(round_trip.comment(), Some("tbl"));
+    }
+
+    #[test]
+    fn formats_table_path_and_table_bucket() {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        assert_eq!(table_path.database(), "db");
+        assert_eq!(table_path.table(), "tbl");
+        assert_eq!(format!("{table_path}"), "db.tbl");
+
+        let bucket = TableBucket::new(10, 2);
+        assert_eq!(bucket.table_id(), 10);
+        assert_eq!(bucket.bucket_id(), 2);
+        assert_eq!(format!("{bucket}"), "TableBucket(table_id=10, bucket=2)");
+    }
+
+    #[test]
+    fn default_bucket_key_detection() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .expect("schema");
+        let descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(2), vec![])
+            .build()
+            .expect("descriptor");
+
+        assert!(descriptor.is_default_bucket_key().expect("default"));
+    }
+
+    #[test]
+    fn log_format_and_kv_format_parsing() {
+        assert_eq!(LogFormat::parse("arrow").unwrap(), LogFormat::ARROW);
+        assert!(LogFormat::parse("unknown").is_err());
+
+        assert_eq!(KvFormat::parse("indexed").unwrap(), KvFormat::INDEXED);
+        assert!(KvFormat::parse("bad").is_err());
+    }
+
+    #[test]
+    fn table_info_flags_and_replication_factor() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("p", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .expect("schema");
+        let descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .partitioned_by(vec!["p".to_string()])
+            .distributed_by(Some(2), vec![])
+            .build()
+            .expect("descriptor")
+            .with_replication_factor(3);
+
+        assert!(descriptor.is_partitioned());
+        assert!(descriptor.has_primary_key());
+        assert_eq!(descriptor.replication_factor().unwrap(), 3);
+
+        let info = TableInfo::of(
+            TablePath::new("db".to_string(), "tbl".to_string()),
+            10,
+            1,
+            descriptor,
+            0,
+            0,
+        );
+
+        assert!(info.has_primary_key());
+        assert!(info.has_bucket_key());
+        assert!(info.is_partitioned());
+        assert!(info.is_default_bucket_key());
+        assert_eq!(info.get_physical_primary_keys(), &["id".to_string()]);
+    }
+
+    #[test]
+    fn schema_primary_key_indexes_and_column_names() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .expect("schema");
+
+        assert_eq!(schema.primary_key_indexes(), vec![0]);
+        assert_eq!(schema.primary_key_column_names(), vec!["id"]);
+        assert_eq!(schema.column_names(), vec!["id", "name"]);
     }
 }

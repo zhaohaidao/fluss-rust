@@ -118,11 +118,21 @@ async def main():
         append_writer.write_arrow_batch(pa_record_batch)
         print("Successfully wrote PyArrow RecordBatch")
 
-        # Test 3: Write Pandas DataFrame
+        # Test 3: Append single rows
+        print("\n--- Testing single row append ---")
+        # Dict input
+        await append_writer.append({"id": 8, "name": "Helen", "score": 93.5, "age": 26})
+        print("Successfully appended row (dict)")
+
+        # List input
+        await append_writer.append([9, "Ivan", 90.0, 31])
+        print("Successfully appended row (list)")
+
+        # Test 4: Write Pandas DataFrame
         print("\n--- Testing Pandas DataFrame write ---")
         df = pd.DataFrame(
             {
-                "id": [6, 7],
+                "id": [10, 11],
                 "name": ["Frank", "Grace"],
                 "score": [89.3, 94.7],
                 "age": [29, 27],
@@ -177,6 +187,28 @@ async def main():
 
     except Exception as e:
         print(f"Error during scanning: {e}")
+
+    # Demo: Column projection
+    print("\n--- Testing Column Projection ---")
+    try:
+        # Project specific columns by index
+        print("\n1. Projection by index [0, 1] (id, name):")
+        scanner_index = await table.new_log_scanner(project=[0, 1])
+        scanner_index.subscribe(None, None)
+        df_projected = scanner_index.to_pandas()
+        print(df_projected.head())
+        print(f"   Projected {df_projected.shape[1]} columns: {list(df_projected.columns)}")
+
+        # Project specific columns by name (Pythonic!)
+        print("\n2. Projection by name ['name', 'score'] (Pythonic):")
+        scanner_names = await table.new_log_scanner(columns=["name", "score"])
+        scanner_names.subscribe(None, None)
+        df_named = scanner_names.to_pandas()
+        print(df_named.head())
+        print(f"   Projected {df_named.shape[1]} columns: {list(df_named.columns)}")
+
+    except Exception as e:
+        print(f"Error during projection: {e}")
 
     # Close connection
     conn.close()

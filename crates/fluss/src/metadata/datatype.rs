@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::error::Error::IllegalArgument;
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 
@@ -680,11 +682,11 @@ impl Default for BytesType {
 }
 
 impl BytesType {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self::with_nullable(true)
     }
 
-    pub fn with_nullable(nullable: bool) -> Self {
+    pub const fn with_nullable(nullable: bool) -> Self {
         Self { nullable }
     }
 
@@ -857,6 +859,31 @@ impl RowType {
         self.fields.iter().position(|f| f.name == field_name)
     }
 
+    pub fn field_types(&self) -> impl Iterator<Item = &DataType> + '_ {
+        self.fields.iter().map(|f| &f.data_type)
+    }
+
+    pub fn get_field_names(&self) -> Vec<&str> {
+        self.fields.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    pub fn project(&self, project_field_positions: &[usize]) -> Result<RowType> {
+        Ok(RowType::with_nullable(
+            self.nullable,
+            project_field_positions
+                .iter()
+                .map(|pos| {
+                    self.fields
+                        .get(*pos)
+                        .cloned()
+                        .ok_or_else(|| IllegalArgument {
+                            message: format!("invalid field position: {}", *pos),
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        ))
+    }
+
     #[cfg(test)]
     pub fn with_data_types(data_types: Vec<DataType>) -> Self {
         let mut fields: Vec<DataField> = Vec::new();
@@ -908,7 +935,7 @@ impl DataTypes {
         DataType::Binary(BinaryType::new(length))
     }
 
-    pub fn bytes() -> DataType {
+    pub const fn bytes() -> DataType {
         DataType::Bytes(BytesType::new())
     }
 

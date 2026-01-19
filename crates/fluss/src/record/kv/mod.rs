@@ -15,21 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod api_key;
-mod api_version;
-pub mod error;
-mod fluss_api_error;
-pub use fluss_api_error::{ApiError, FlussError};
-mod frame;
-pub mod message;
-pub use error::*;
-mod server_connection;
-pub use server_connection::*;
-mod convert;
-mod transport;
-#[cfg(test)]
-pub(crate) use api_key::ApiKey;
-#[cfg(test)]
-pub(crate) use transport::Transport;
+//! Key-Value record and batch implementations.
 
-pub use convert::*;
+mod kv_record;
+mod kv_record_batch;
+mod kv_record_batch_builder;
+
+pub use kv_record::{KvRecord, LENGTH_LENGTH as KV_RECORD_LENGTH_LENGTH};
+pub use kv_record_batch::*;
+pub use kv_record_batch_builder::*;
+
+/// Current KV magic value
+pub const CURRENT_KV_MAGIC_VALUE: u8 = 0;
+
+/// No writer ID constant
+pub const NO_WRITER_ID: i64 = -1;
+
+/// No batch sequence constant
+pub const NO_BATCH_SEQUENCE: i32 = -1;
