@@ -15,28 +15,45 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::metadata::RowType;
 use crate::row::compacted::compacted_row::calculate_bit_set_width_in_bytes;
 use crate::{
     metadata::DataType,
-    row::{Datum, GenericRow, compacted::compacted_row_writer::CompactedRowWriter},
+    row::{Datum, Decimal, GenericRow, compacted::compacted_row_writer::CompactedRowWriter},
+    util::varint::{read_unsigned_varint_at, read_unsigned_varint_u64_at},
 };
+use std::borrow::Cow;
 use std::str::from_utf8;
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct CompactedRowDeserializer<'a> {
-    schema: &'a [DataType],
+    row_type: Cow<'a, RowType>,
 }
 
 #[allow(dead_code)]
 impl<'a> CompactedRowDeserializer<'a> {
-    pub fn new(schema: &'a [DataType]) -> Self {
-        Self { schema }
+    pub fn new(row_type: &'a RowType) -> Self {
+        Self {
+            row_type: Cow::Borrowed(row_type),
+        }
+    }
+
+    pub fn new_from_owned(row_type: RowType) -> Self {
+        Self {
+            row_type: Cow::Owned(row_type),
+        }
+    }
+
+    pub fn get_row_type(&self) -> &RowType {
+        self.row_type.as_ref()
     }
 
     pub fn deserialize(&self, reader: &CompactedRowReader<'a>) -> GenericRow<'a> {
         let mut row = GenericRow::new();
         let mut cursor = reader.initial_position();
-        for (col_pos, dtype) in self.schema.iter().enumerate() {
+        for (col_pos, data_field) in self.row_type.fields().iter().enumerate() {
+            let dtype = &data_field.data_type;
             if dtype.is_nullable() && reader.is_null_at(col_pos) {
                 row.set_field(col_pos, Datum::Null);
                 continue;
@@ -80,7 +97,75 @@ impl<'a> CompactedRowDeserializer<'a> {
                     let (val, next) = reader.read_bytes(cursor);
                     (Datum::Blob(val.into()), next)
                 }
-                _ => panic!("unsupported DataType in CompactedRowDeserializer"),
+                DataType::Decimal(decimal_type) => {
+                    let precision = decimal_type.precision();
+                    let scale = decimal_type.scale();
+                    if Decimal::is_compact_precision(precision) {
+                        // Compact: stored as i64
+                        let (val, next) = reader.read_long(cursor);
+                        let decimal = Decimal::from_unscaled_long(val, precision, scale)
+                            .expect("Failed to create decimal from unscaled long");
+                        (Datum::Decimal(decimal), next)
+                    } else {
+                        // Non-compact: stored as minimal big-endian bytes
+                        let (bytes, next) = reader.read_bytes(cursor);
+                        let decimal = Decimal::from_unscaled_bytes(bytes, precision, scale)
+                            .expect("Failed to create decimal from unscaled bytes");
+                        (Datum::Decimal(decimal), next)
+                    }
+                }
+                DataType::Date(_) => {
+                    let (val, next) = reader.read_int(cursor);
+                    (Datum::Date(crate::row::datum::Date::new(val)), next)
+                }
+                DataType::Time(_) => {
+                    let (val, next) = reader.read_int(cursor);
+                    (Datum::Time(crate::row::datum::Time::new(val)), next)
+                }
+                DataType::Timestamp(timestamp_type) => {
+                    let precision = timestamp_type.precision();
+                    if crate::row::datum::TimestampNtz::is_compact(precision) {
+                        // Compact: only milliseconds
+                        let (millis, next) = reader.read_long(cursor);
+                        (
+                            Datum::TimestampNtz(crate::row::datum::TimestampNtz::new(millis)),
+                            next,
+                        )
+                    } else {
+                        // Non-compact: milliseconds + nanos
+                        let (millis, mid) = reader.read_long(cursor);
+                        let (nanos, next) = reader.read_int(mid);
+                        let timestamp =
+                            crate::row::datum::TimestampNtz::from_millis_nanos(millis, nanos)
+                                .expect("Invalid nano_of_millisecond value in compacted row");
+                        (Datum::TimestampNtz(timestamp), next)
+                    }
+                }
+                DataType::TimestampLTz(timestamp_ltz_type) => {
+                    let precision = timestamp_ltz_type.precision();
+                    if crate::row::datum::TimestampLtz::is_compact(precision) {
+                        // Compact: only epoch milliseconds
+                        let (epoch_millis, next) = reader.read_long(cursor);
+                        (
+                            Datum::TimestampLtz(crate::row::datum::TimestampLtz::new(epoch_millis)),
+                            next,
+                        )
+                    } else {
+                        // Non-compact: epoch milliseconds + nanos
+                        let (epoch_millis, mid) = reader.read_long(cursor);
+                        let (nanos, next) = reader.read_int(mid);
+                        let timestamp_ltz =
+                            crate::row::datum::TimestampLtz::from_millis_nanos(epoch_millis, nanos)
+                                .expect("Invalid nano_of_millisecond value in compacted row");
+                        (Datum::TimestampLtz(timestamp_ltz), next)
+                    }
+                }
+                _ => {
+                    panic!(
+                        "Unsupported DataType in CompactedRowDeserializer: {:?}",
+                        dtype
+                    );
+                }
             };
             cursor = next_cursor;
             row.set_field(col_pos, datum);
@@ -150,36 +235,18 @@ impl<'a> CompactedRowReader<'a> {
         (val, next_pos)
     }
 
-    pub fn read_int(&self, mut pos: usize) -> (i32, usize) {
-        let mut result: u32 = 0;
-        let mut shift = 0;
-
-        for _ in 0..CompactedRowWriter::MAX_INT_SIZE {
-            let (b, next_pos) = self.read_byte(pos);
-            pos = next_pos;
-            result |= ((b & 0x7F) as u32) << shift;
-            if (b & 0x80) == 0 {
-                return (result as i32, pos);
-            }
-            shift += 7;
+    pub fn read_int(&self, pos: usize) -> (i32, usize) {
+        match read_unsigned_varint_at(self.segment, pos, CompactedRowWriter::MAX_INT_SIZE) {
+            Ok((value, next_pos)) => (value as i32, next_pos),
+            Err(_) => panic!("Invalid VarInt32 input stream."),
         }
-        panic!("Invalid VarInt32 input stream.");
     }
 
-    pub fn read_long(&self, mut pos: usize) -> (i64, usize) {
-        let mut result: u64 = 0;
-        let mut shift = 0;
-
-        for _ in 0..CompactedRowWriter::MAX_LONG_SIZE {
-            let (b, next_pos) = self.read_byte(pos);
-            pos = next_pos;
-            result |= ((b & 0x7F) as u64) << shift;
-            if (b & 0x80) == 0 {
-                return (result as i64, pos);
-            }
-            shift += 7;
+    pub fn read_long(&self, pos: usize) -> (i64, usize) {
+        match read_unsigned_varint_u64_at(self.segment, pos, CompactedRowWriter::MAX_LONG_SIZE) {
+            Ok((value, next_pos)) => (value as i64, next_pos),
+            Err(_) => panic!("Invalid VarInt64 input stream."),
         }
-        panic!("Invalid VarInt64 input stream.");
     }
 
     pub fn read_float(&self, pos: usize) -> (f32, usize) {

@@ -18,14 +18,41 @@
 mod column;
 
 mod datum;
+mod decimal;
 
-mod binary;
-mod compacted;
-mod encode;
-mod field_getter;
+pub mod binary;
+pub mod compacted;
+pub mod encode;
+pub mod field_getter;
+mod row_decoder;
 
+use crate::client::WriteFormat;
+use bytes::Bytes;
 pub use column::*;
+pub use compacted::CompactedRow;
 pub use datum::*;
+pub use decimal::{Decimal, MAX_COMPACT_PRECISION};
+pub use encode::KeyEncoder;
+pub use row_decoder::{CompactedRowDecoder, RowDecoder, RowDecoderFactory};
+
+pub struct BinaryRow<'a> {
+    data: BinaryDataWrapper<'a>,
+}
+
+pub enum BinaryDataWrapper<'a> {
+    Bytes(Bytes),
+    Ref(&'a [u8]),
+}
+
+impl<'a> BinaryRow<'a> {
+    /// Returns the binary representation of this row as a byte slice.
+    pub fn as_bytes(&'a self) -> &'a [u8] {
+        match &self.data {
+            BinaryDataWrapper::Bytes(bytes) => bytes.as_ref(),
+            BinaryDataWrapper::Ref(r) => r,
+        }
+    }
+}
 
 // TODO make functions return Result<?> for better error handling
 pub trait InternalRow {
@@ -62,22 +89,40 @@ pub trait InternalRow {
     /// Returns the string value at the given position
     fn get_string(&self, pos: usize) -> &str;
 
-    // /// Returns the decimal value at the given position
-    // fn get_decimal(&self, pos: usize, precision: usize, scale: usize) -> Decimal;
+    /// Returns the decimal value at the given position
+    fn get_decimal(&self, pos: usize, precision: usize, scale: usize) -> Decimal;
 
-    // /// Returns the timestamp value at the given position
-    // fn get_timestamp_ntz(&self, pos: usize, precision: usize) -> TimestampNtz;
+    /// Returns the date value at the given position (date as days since epoch)
+    fn get_date(&self, pos: usize) -> datum::Date;
 
-    // /// Returns the timestamp value at the given position
-    // fn get_timestamp_ltz(&self, pos: usize, precision: usize) -> TimestampLtz;
+    /// Returns the time value at the given position (time as milliseconds since midnight)
+    fn get_time(&self, pos: usize) -> datum::Time;
+
+    /// Returns the timestamp value at the given position (timestamp without timezone)
+    ///
+    /// The precision is required to determine whether the timestamp value was stored
+    /// in a compact representation (precision <= 3) or with nanosecond precision.
+    fn get_timestamp_ntz(&self, pos: usize, precision: u32) -> datum::TimestampNtz;
+
+    /// Returns the timestamp value at the given position (timestamp with local timezone)
+    ///
+    /// The precision is required to determine whether the timestamp value was stored
+    /// in a compact representation (precision <= 3) or with nanosecond precision.
+    fn get_timestamp_ltz(&self, pos: usize, precision: u32) -> datum::TimestampLtz;
 
     /// Returns the binary value at the given position with fixed length
     fn get_binary(&self, pos: usize, length: usize) -> &[u8];
 
     /// Returns the binary value at the given position
     fn get_bytes(&self, pos: usize) -> &[u8];
+
+    /// Returns encoded bytes if already encoded
+    fn as_encoded_bytes(&self, _write_format: WriteFormat) -> Option<&[u8]> {
+        None
+    }
 }
 
+#[derive(Debug)]
 pub struct GenericRow<'a> {
     pub values: Vec<Datum<'a>>,
 }
@@ -112,6 +157,43 @@ impl<'a> InternalRow for GenericRow<'a> {
 
     fn get_long(&self, _pos: usize) -> i64 {
         self.values.get(_pos).unwrap().try_into().unwrap()
+    }
+
+    fn get_decimal(&self, pos: usize, _precision: usize, _scale: usize) -> Decimal {
+        match self.values.get(pos).unwrap() {
+            Datum::Decimal(d) => d.clone(),
+            other => panic!("Expected Decimal at pos {pos:?}, got {other:?}"),
+        }
+    }
+
+    fn get_date(&self, pos: usize) -> datum::Date {
+        match self.values.get(pos).unwrap() {
+            Datum::Date(d) => *d,
+            Datum::Int32(i) => datum::Date::new(*i),
+            other => panic!("Expected Date or Int32 at pos {pos:?}, got {other:?}"),
+        }
+    }
+
+    fn get_time(&self, pos: usize) -> datum::Time {
+        match self.values.get(pos).unwrap() {
+            Datum::Time(t) => *t,
+            Datum::Int32(i) => datum::Time::new(*i),
+            other => panic!("Expected Time or Int32 at pos {pos:?}, got {other:?}"),
+        }
+    }
+
+    fn get_timestamp_ntz(&self, pos: usize, _precision: u32) -> datum::TimestampNtz {
+        match self.values.get(pos).unwrap() {
+            Datum::TimestampNtz(t) => *t,
+            other => panic!("Expected TimestampNtz at pos {pos:?}, got {other:?}"),
+        }
+    }
+
+    fn get_timestamp_ltz(&self, pos: usize, _precision: u32) -> datum::TimestampLtz {
+        match self.values.get(pos).unwrap() {
+            Datum::TimestampLtz(t) => *t,
+            other => panic!("Expected TimestampLtz at pos {pos:?}, got {other:?}"),
+        }
     }
 
     fn get_float(&self, pos: usize) -> f32 {

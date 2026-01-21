@@ -15,10 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::row::Decimal;
+use crate::row::binary::BinaryWriter;
+use crate::row::compacted::compacted_row::calculate_bit_set_width_in_bytes;
+use crate::util::varint::{write_unsigned_varint_to_slice, write_unsigned_varint_u64_to_slice};
 use bytes::{Bytes, BytesMut};
 use std::cmp;
-
-use crate::row::compacted::compacted_row::calculate_bit_set_width_in_bytes;
 
 // Writer for CompactedRow
 // Reference implementation:
@@ -49,11 +51,6 @@ impl CompactedRowWriter {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.position = self.header_size_in_bytes;
-        self.buffer[..self.header_size_in_bytes].fill(0);
-    }
-
     pub fn position(&self) -> usize {
         self.position
     }
@@ -64,6 +61,18 @@ impl CompactedRowWriter {
 
     pub fn to_bytes(&self) -> Bytes {
         Bytes::copy_from_slice(&self.buffer[..self.position])
+    }
+
+    /// Flushes writer's ByteMut, resetting writer's inner state and returns Byte of flushed state
+    pub fn flush_bytes(&mut self) -> Bytes {
+        let used = self.buffer.split_to(self.position);
+        self.position = self.header_size_in_bytes;
+        if self.buffer.len() < self.header_size_in_bytes {
+            self.buffer.resize(self.header_size_in_bytes.max(64), 0);
+        } else {
+            self.buffer[..self.header_size_in_bytes].fill(0);
+        }
+        used.freeze()
     }
 
     fn ensure_capacity(&mut self, need_len: usize) {
@@ -79,78 +88,180 @@ impl CompactedRowWriter {
         self.buffer[self.position..end].copy_from_slice(src);
         self.position = end;
     }
+}
 
-    pub fn set_null_at(&mut self, pos: usize) {
+impl BinaryWriter for CompactedRowWriter {
+    fn reset(&mut self) {
+        self.position = self.header_size_in_bytes;
+        self.buffer[..self.header_size_in_bytes].fill(0);
+    }
+
+    fn set_null_at(&mut self, pos: usize) {
         let byte_index = pos >> 3;
         let bit = pos & 7;
         debug_assert!(byte_index < self.header_size_in_bytes);
         self.buffer[byte_index] |= 1u8 << bit;
     }
 
-    pub fn write_boolean(&mut self, value: bool) {
+    fn write_boolean(&mut self, value: bool) {
         let b = if value { 1u8 } else { 0u8 };
-        self.write_raw(&[b]);
+        self.write_raw(&[b])
     }
 
-    pub fn write_byte(&mut self, value: u8) {
-        self.write_raw(&[value]);
+    fn write_byte(&mut self, value: u8) {
+        self.write_raw(&[value])
     }
 
-    pub fn write_binary(&mut self, bytes: &[u8], length: usize) {
-        // TODO: currently, we encoding BINARY(length) as the same with BYTES, the length info can
-        //  be omitted and the bytes length should be enforced in the future.
-        self.write_bytes(&bytes[..length.min(bytes.len())]);
-    }
-
-    pub fn write_bytes(&mut self, value: &[u8]) {
-        let len_i32 =
-            i32::try_from(value.len()).expect("byte slice too large to encode length as i32");
+    fn write_bytes(&mut self, value: &[u8]) {
+        let len_i32 = i32::try_from(value.len())
+            .expect("Byte slice too large to encode length as i32: exceeds i32::MAX");
         self.write_int(len_i32);
-        self.write_raw(value);
+        self.write_raw(value)
     }
 
-    pub fn write_char(&mut self, value: &str, _length: usize) {
+    fn write_char(&mut self, value: &str, _length: usize) {
         // TODO: currently, we encoding CHAR(length) as the same with STRING, the length info can be
         //  omitted and the bytes length should be enforced in the future.
-        self.write_string(value);
+        self.write_string(value)
     }
 
-    pub fn write_string(&mut self, value: &str) {
-        self.write_bytes(value.as_ref());
+    fn write_string(&mut self, value: &str) {
+        self.write_bytes(value.as_ref())
     }
 
-    pub fn write_short(&mut self, value: i16) {
-        self.write_raw(&value.to_ne_bytes());
+    fn write_short(&mut self, value: i16) {
+        // Use native endianness to match Java's UnsafeUtils.putShort behavior
+        // Java uses sun.misc.Unsafe which writes in native byte order (typically LE on x86/ARM)
+        self.write_raw(&value.to_ne_bytes())
     }
 
-    pub fn write_int(&mut self, value: i32) {
+    fn write_int(&mut self, value: i32) {
         self.ensure_capacity(Self::MAX_INT_SIZE);
-        let mut v = value as u32;
-        while (v & !0x7F) != 0 {
-            self.buffer[self.position] = ((v as u8) & 0x7F) | 0x80;
-            self.position += 1;
-            v >>= 7;
-        }
-        self.buffer[self.position] = v as u8;
-        self.position += 1;
+        let bytes_written =
+            write_unsigned_varint_to_slice(value as u32, &mut self.buffer[self.position..]);
+        self.position += bytes_written;
     }
-    pub fn write_long(&mut self, value: i64) {
+
+    fn write_long(&mut self, value: i64) {
         self.ensure_capacity(Self::MAX_LONG_SIZE);
-        let mut v = value as u64;
-        while (v & !0x7F) != 0 {
-            self.buffer[self.position] = ((v as u8) & 0x7F) | 0x80;
-            self.position += 1;
-            v >>= 7;
+        let bytes_written =
+            write_unsigned_varint_u64_to_slice(value as u64, &mut self.buffer[self.position..]);
+        self.position += bytes_written;
+    }
+
+    fn write_float(&mut self, value: f32) {
+        // Use native endianness to match Java's UnsafeUtils.putFloat behavior
+        self.write_raw(&value.to_ne_bytes())
+    }
+
+    fn write_double(&mut self, value: f64) {
+        // Use native endianness to match Java's UnsafeUtils.putDouble behavior
+        self.write_raw(&value.to_ne_bytes())
+    }
+
+    fn write_binary(&mut self, bytes: &[u8], length: usize) {
+        // TODO: currently, we encoding BINARY(length) as the same with BYTES, the length info can
+        //  be omitted and the bytes length should be enforced in the future.
+        self.write_bytes(&bytes[..length.min(bytes.len())])
+    }
+
+    fn complete(&mut self) {
+        // do nothing
+    }
+
+    fn write_decimal(&mut self, value: &Decimal, precision: u32) {
+        // Decimal is already validated and rescaled during construction.
+        // Just serialize the precomputed unscaled representation.
+        if Decimal::is_compact_precision(precision) {
+            self.write_long(
+                value
+                    .to_unscaled_long()
+                    .expect("Decimal should fit in i64 for compact precision"),
+            )
+        } else {
+            self.write_bytes(&value.to_unscaled_bytes())
         }
-        self.buffer[self.position] = v as u8;
-        self.position += 1;
     }
 
-    pub fn write_float(&mut self, value: f32) {
-        self.write_raw(&value.to_ne_bytes());
+    fn write_time(&mut self, value: i32, _precision: u32) {
+        // TIME is always encoded as i32 (milliseconds since midnight) regardless of precision
+        self.write_int(value)
     }
 
-    pub fn write_double(&mut self, value: f64) {
-        self.write_raw(&value.to_ne_bytes());
+    fn write_timestamp_ntz(&mut self, value: &crate::row::datum::TimestampNtz, precision: u32) {
+        if crate::row::datum::TimestampNtz::is_compact(precision) {
+            // Compact: write only milliseconds
+            self.write_long(value.get_millisecond());
+        } else {
+            // Non-compact: write milliseconds + nanoOfMillisecond
+            self.write_long(value.get_millisecond());
+            self.write_int(value.get_nano_of_millisecond());
+        }
+    }
+
+    fn write_timestamp_ltz(&mut self, value: &crate::row::datum::TimestampLtz, precision: u32) {
+        if crate::row::datum::TimestampLtz::is_compact(precision) {
+            // Compact: write only epoch milliseconds
+            self.write_long(value.get_epoch_millisecond());
+        } else {
+            // Non-compact: write epoch milliseconds + nanoOfMillisecond
+            self.write_long(value.get_epoch_millisecond());
+            self.write_int(value.get_nano_of_millisecond());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bigdecimal::{BigDecimal, num_bigint::BigInt};
+
+    #[test]
+    fn test_write_decimal_compact() {
+        // Compact decimal (precision <= 18)
+        let bd = BigDecimal::new(BigInt::from(12345), 2); // 123.45
+        let decimal = Decimal::from_big_decimal(bd, 10, 2).unwrap();
+
+        let mut w = CompactedRowWriter::new(1);
+        w.write_decimal(&decimal, 10);
+
+        let (val, _) = crate::util::varint::read_unsigned_varint_u64_at(
+            w.buffer(),
+            w.header_size_in_bytes,
+            CompactedRowWriter::MAX_LONG_SIZE,
+        )
+        .unwrap();
+        assert_eq!(val as i64, 12345);
+    }
+
+    #[test]
+    fn test_write_decimal_rounding() {
+        // Test HALF_UP rounding: 12.345 → 12.35
+        let bd = BigDecimal::new(BigInt::from(12345), 3);
+        let decimal = Decimal::from_big_decimal(bd, 10, 2).unwrap();
+
+        let mut w = CompactedRowWriter::new(1);
+        w.write_decimal(&decimal, 10);
+
+        let (val, _) = crate::util::varint::read_unsigned_varint_u64_at(
+            w.buffer(),
+            w.header_size_in_bytes,
+            CompactedRowWriter::MAX_LONG_SIZE,
+        )
+        .unwrap();
+        assert_eq!(val as i64, 1235); // 12.35 with scale 2
+    }
+
+    #[test]
+    fn test_write_decimal_non_compact() {
+        // Non-compact (precision > 18): uses byte array
+        let bd = BigDecimal::new(BigInt::from(12345), 0);
+        let decimal = Decimal::from_big_decimal(bd, 28, 0).unwrap();
+
+        let mut w = CompactedRowWriter::new(1);
+        w.write_decimal(&decimal, 28);
+
+        // Verify something was written (at least length varint + some bytes)
+        assert!(w.position() > w.header_size_in_bytes);
     }
 }

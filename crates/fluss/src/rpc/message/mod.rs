@@ -34,7 +34,9 @@ mod header;
 mod list_databases;
 mod list_offsets;
 mod list_tables;
+mod lookup;
 mod produce_log;
+mod put_kv;
 mod table_exists;
 mod update_metadata;
 
@@ -53,7 +55,9 @@ pub use header::*;
 pub use list_databases::*;
 pub use list_offsets::*;
 pub use list_tables::*;
+pub use lookup::*;
 pub use produce_log::*;
+pub use put_kv::*;
 pub use table_exists::*;
 pub use update_metadata::*;
 

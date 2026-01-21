@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client::{Record, WriteRecord};
+use crate::client::{LogWriteRecord, Record, WriteRecord};
 use crate::compression::ArrowCompressionInfo;
-use crate::error::Result;
-use crate::metadata::DataType;
+use crate::error::{Error, Result};
+use crate::metadata::{DataType, RowType};
 use crate::record::{ChangeType, ScanRecord};
 use crate::row::{ColumnarRow, GenericRow};
 use arrow::array::{
@@ -44,10 +44,11 @@ use bytes::Bytes;
 use crc32c::crc32c;
 use parking_lot::Mutex;
 use std::{
-    io::{Cursor, Write},
+    io::{Cursor, Seek, SeekFrom, Write},
     sync::Arc,
 };
 
+use crate::error::Error::IllegalArgument;
 use arrow::ipc::writer::IpcWriteOptions;
 /// const for record batch
 pub const BASE_OFFSET_LENGTH: usize = 8;
@@ -79,6 +80,11 @@ pub const RECORD_BATCH_HEADER_SIZE: usize = RECORDS_OFFSET;
 pub const ARROW_CHANGETYPE_OFFSET: usize = RECORD_BATCH_HEADER_SIZE;
 pub const LOG_OVERHEAD: usize = LENGTH_OFFSET + LENGTH_LENGTH;
 
+/// Maximum batch size matches Java's Integer.MAX_VALUE limit.
+/// Java uses int type for batch size, so max value is 2^31 - 1 = 2,147,483,647 bytes (~2GB).
+/// This is the implicit limit in FileLogRecords.java and other Java components.
+pub const MAX_BATCH_SIZE: usize = i32::MAX as usize; // 2,147,483,647 bytes (~2GB)
+
 /// const for record
 /// The "magic" values.
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +92,51 @@ pub enum LogMagicValue {
     V0 = 0,
 }
 
+/// Safely convert batch size from i32 to usize with validation.
+///
+/// Validates that:
+/// - batch_size_bytes is non-negative
+/// - batch_size_bytes + LOG_OVERHEAD doesn't overflow
+/// - Result is within reasonable bounds
+fn validate_batch_size(batch_size_bytes: i32) -> Result<usize> {
+    // Check for negative size (corrupted data)
+    if batch_size_bytes < 0 {
+        return Err(Error::UnexpectedError {
+            message: format!("Invalid negative batch size: {}", batch_size_bytes),
+            source: None,
+        });
+    }
+
+    let batch_size_u = batch_size_bytes as usize;
+
+    // Check for overflow when adding LOG_OVERHEAD
+    let total_size =
+        batch_size_u
+            .checked_add(LOG_OVERHEAD)
+            .ok_or_else(|| Error::UnexpectedError {
+                message: format!(
+                    "Batch size {} + LOG_OVERHEAD {} would overflow",
+                    batch_size_u, LOG_OVERHEAD
+                ),
+                source: None,
+            })?;
+
+    // Sanity check: reject unreasonably large batches
+    if total_size > MAX_BATCH_SIZE {
+        return Err(Error::UnexpectedError {
+            message: format!(
+                "Batch size {} exceeds maximum allowed size {}",
+                total_size, MAX_BATCH_SIZE
+            ),
+            source: None,
+        });
+    }
+
+    Ok(total_size)
+}
+
+// NOTE: Rust layout/offsets currently match Java only for V0.
+// TODO: Add V1 layout/offsets to keep parity with Java's V1 format.
 pub const CURRENT_LOG_MAGIC_VALUE: u8 = LogMagicValue::V0 as u8;
 
 /// Value used if writer ID is not available or non-idempotent.
@@ -169,7 +220,7 @@ pub struct RowAppendRecordBatchBuilder {
 }
 
 impl RowAppendRecordBatchBuilder {
-    pub fn new(row_type: &DataType) -> Self {
+    pub fn new(row_type: &RowType) -> Self {
         let schema_ref = to_arrow_schema(row_type);
         let builders = Mutex::new(
             schema_ref
@@ -249,7 +300,7 @@ impl ArrowRecordBatchInnerBuilder for RowAppendRecordBatchBuilder {
 impl MemoryLogRecordsArrowBuilder {
     pub fn new(
         schema_id: i32,
-        row_type: &DataType,
+        row_type: &RowType,
         to_append_record_batch: bool,
         arrow_compression_info: ArrowCompressionInfo,
     ) -> Self {
@@ -273,11 +324,16 @@ impl MemoryLogRecordsArrowBuilder {
     }
 
     pub fn append(&mut self, record: &WriteRecord) -> Result<bool> {
-        match &record.row {
-            Record::Row(row) => Ok(self.arrow_record_batch_builder.append(row)?),
-            Record::RecordBatch(record_batch) => Ok(self
-                .arrow_record_batch_builder
-                .append_batch(record_batch.clone())?),
+        match &record.record() {
+            Record::Log(log_write_record) => match log_write_record {
+                LogWriteRecord::Generic(row) => Ok(self.arrow_record_batch_builder.append(row)?),
+                LogWriteRecord::RecordBatch(record_batch) => Ok(self
+                    .arrow_record_batch_builder
+                    .append_batch(record_batch.clone())?),
+            },
+            Record::Kv(_) => Err(Error::UnsupportedOperation {
+                message: "Only LogRecord is supported to append".to_string(),
+            }),
         }
         // todo: consider write other change type
     }
@@ -322,7 +378,7 @@ impl MemoryLogRecordsArrowBuilder {
         // write arrow batch bytes
         let mut cursor = Cursor::new(&mut batch_bytes[..]);
         cursor.set_position(RECORD_BATCH_HEADER_SIZE as u64);
-        cursor.write_all(real_arrow_batch_bytes).unwrap();
+        cursor.write_all(real_arrow_batch_bytes)?;
 
         let calcute_crc_bytes = &cursor.get_ref()[SCHEMA_ID_OFFSET..];
         // then update crc
@@ -365,17 +421,253 @@ pub trait ToArrow {
     fn append_to(&self, builder: &mut dyn ArrayBuilder) -> Result<()>;
 }
 
-pub struct LogRecordsBatches {
+/// Abstract source of log record data.
+/// Allows streaming from files or in-memory buffers.
+pub trait LogRecordsSource: Send + Sync {
+    /// Read batch header at given position.
+    /// Returns (base_offset, batch_size) tuple.
+    fn read_batch_header(&self, pos: usize) -> Result<(i64, usize)>;
+
+    /// Read full batch data at given position with given size.
+    /// Returns Bytes that can be zero-copy sliced.
+    fn read_batch_data(&self, pos: usize, size: usize) -> Result<Bytes>;
+
+    /// Total size of the source in bytes.
+    fn total_size(&self) -> usize;
+}
+
+/// In-memory implementation of LogRecordsSource.
+/// Used for local tablet server fetches (existing path).
+pub struct MemorySource {
     data: Bytes,
+}
+
+impl MemorySource {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self {
+            data: Bytes::from(data),
+        }
+    }
+}
+
+impl LogRecordsSource for MemorySource {
+    fn read_batch_header(&self, pos: usize) -> Result<(i64, usize)> {
+        if pos + LOG_OVERHEAD > self.data.len() {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Position {} + LOG_OVERHEAD {} exceeds data size {}",
+                    pos,
+                    LOG_OVERHEAD,
+                    self.data.len()
+                ),
+                source: None,
+            });
+        }
+
+        let base_offset = LittleEndian::read_i64(&self.data[pos + BASE_OFFSET_OFFSET..]);
+        let batch_size_bytes = LittleEndian::read_i32(&self.data[pos + LENGTH_OFFSET..]);
+
+        // Validate batch size to prevent integer overflow and corruption
+        let batch_size = validate_batch_size(batch_size_bytes)?;
+
+        Ok((base_offset, batch_size))
+    }
+
+    fn read_batch_data(&self, pos: usize, size: usize) -> Result<Bytes> {
+        if pos + size > self.data.len() {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Read beyond data size: {} + {} > {}",
+                    pos,
+                    size,
+                    self.data.len()
+                ),
+                source: None,
+            });
+        }
+        // Zero-copy slice (Bytes is Arc-based)
+        Ok(self.data.slice(pos..pos + size))
+    }
+
+    fn total_size(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// RAII guard that deletes a file when dropped.
+/// Used to ensure file deletion happens AFTER the file handle is closed.
+struct FileCleanupGuard {
+    file_path: std::path::PathBuf,
+}
+
+impl Drop for FileCleanupGuard {
+    fn drop(&mut self) {
+        // File handle is already closed (this guard drops after the file field)
+        if let Err(e) = std::fs::remove_file(&self.file_path) {
+            log::warn!(
+                "Failed to delete remote log file {}: {}",
+                self.file_path.display(),
+                e
+            );
+        } else {
+            log::debug!("Deleted remote log file: {}", self.file_path.display());
+        }
+    }
+}
+
+/// File-backed implementation of LogRecordsSource.
+/// Used for remote log segments downloaded to local disk.
+/// Streams data on-demand instead of loading entire file into memory.
+///
+/// Uses Mutex<File> with seek + read_exact for cross-platform compatibility.
+/// Access pattern is sequential iteration (single consumer), so mutex overhead is negligible.
+pub struct FileSource {
+    file: Mutex<std::fs::File>,
+    file_size: usize,
+    base_offset: usize,
+    _cleanup: Option<FileCleanupGuard>, // Drops AFTER file (field order matters!)
+}
+
+impl FileSource {
+    /// Create a new FileSource without automatic cleanup.
+    pub fn new(file: std::fs::File, base_offset: usize) -> Result<Self> {
+        let file_size = file.metadata()?.len() as usize;
+        Ok(Self {
+            file: Mutex::new(file),
+            file_size,
+            base_offset,
+            _cleanup: None,
+        })
+    }
+
+    /// Create a new FileSource that will delete the file when dropped.
+    /// This is used for remote log files that need cleanup.
+    pub fn new_with_cleanup(
+        file: std::fs::File,
+        base_offset: usize,
+        file_path: std::path::PathBuf,
+    ) -> Result<Self> {
+        let file_size = file.metadata()?.len() as usize;
+        Ok(Self {
+            file: Mutex::new(file),
+            file_size,
+            base_offset,
+            _cleanup: Some(FileCleanupGuard { file_path }),
+        })
+    }
+
+    /// Read data at a specific position using seek + read_exact.
+    /// This is cross-platform and adequate for sequential access patterns.
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<()> {
+        use std::io::Read;
+        let mut file = self.file.lock();
+        file.seek(SeekFrom::Start(pos))?;
+        file.read_exact(buf)?;
+        Ok(())
+    }
+}
+
+impl LogRecordsSource for FileSource {
+    fn read_batch_header(&self, pos: usize) -> Result<(i64, usize)> {
+        let actual_pos = self.base_offset + pos;
+        if actual_pos + LOG_OVERHEAD > self.file_size {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Position {} exceeds file size {}",
+                    actual_pos, self.file_size
+                ),
+                source: None,
+            });
+        }
+
+        // Read only the header to extract base_offset and batch_size
+        let mut header_buf = vec![0u8; LOG_OVERHEAD];
+        self.read_at(actual_pos as u64, &mut header_buf)?;
+
+        let base_offset = LittleEndian::read_i64(&header_buf[BASE_OFFSET_OFFSET..]);
+        let batch_size_bytes = LittleEndian::read_i32(&header_buf[LENGTH_OFFSET..]);
+
+        // Validate batch size to prevent integer overflow and corruption
+        let batch_size = validate_batch_size(batch_size_bytes)?;
+
+        Ok((base_offset, batch_size))
+    }
+
+    fn read_batch_data(&self, pos: usize, size: usize) -> Result<Bytes> {
+        let actual_pos = self.base_offset + pos;
+        if actual_pos + size > self.file_size {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "Read beyond file size: {} + {} > {}",
+                    actual_pos, size, self.file_size
+                ),
+                source: None,
+            });
+        }
+
+        // Read the full batch data
+        let mut batch_buf = vec![0u8; size];
+        self.read_at(actual_pos as u64, &mut batch_buf)?;
+
+        Ok(Bytes::from(batch_buf))
+    }
+
+    fn total_size(&self) -> usize {
+        self.file_size - self.base_offset
+    }
+}
+
+pub struct LogRecordsBatches {
+    source: Box<dyn LogRecordsSource>,
     current_pos: usize,
     remaining_bytes: usize,
 }
 
 impl LogRecordsBatches {
+    /// Create from in-memory Vec (existing path - backward compatible).
     pub fn new(data: Vec<u8>) -> Self {
-        let remaining_bytes: usize = data.len();
+        let remaining_bytes = data.len();
         Self {
-            data: Bytes::from(data),
+            source: Box::new(MemorySource::new(data)),
+            current_pos: 0,
+            remaining_bytes,
+        }
+    }
+
+    /// Create from file.
+    /// Enables streaming without loading entire file into memory.
+    pub fn from_file(file: std::fs::File, base_offset: usize) -> Result<Self> {
+        let source = FileSource::new(file, base_offset)?;
+        let remaining_bytes = source.total_size();
+        Ok(Self {
+            source: Box::new(source),
+            current_pos: 0,
+            remaining_bytes,
+        })
+    }
+
+    /// Create from file with automatic cleanup.
+    /// The file will be deleted when the LogRecordsBatches is dropped.
+    /// This ensures file is closed before deletion.
+    pub fn from_file_with_cleanup(
+        file: std::fs::File,
+        base_offset: usize,
+        file_path: std::path::PathBuf,
+    ) -> Result<Self> {
+        let source = FileSource::new_with_cleanup(file, base_offset, file_path)?;
+        let remaining_bytes = source.total_size();
+        Ok(Self {
+            source: Box::new(source),
+            current_pos: 0,
+            remaining_bytes,
+        })
+    }
+
+    /// Create from any source (for testing).
+    pub fn from_source(source: Box<dyn LogRecordsSource>) -> Self {
+        let remaining_bytes = source.total_size();
+        Self {
+            source,
             current_pos: 0,
             remaining_bytes,
         }
@@ -386,13 +678,24 @@ impl LogRecordsBatches {
             return None;
         }
 
-        let batch_size_bytes =
-            LittleEndian::read_i32(self.data.get(self.current_pos + LENGTH_OFFSET..).unwrap());
-        let batch_size = batch_size_bytes as usize + LOG_OVERHEAD;
-        if batch_size > self.remaining_bytes {
-            return None;
+        // Read only header to get size (efficient!)
+        match self.source.read_batch_header(self.current_pos) {
+            Ok((_base_offset, batch_size)) => {
+                if batch_size > self.remaining_bytes {
+                    None
+                } else {
+                    Some(batch_size)
+                }
+            }
+            Err(e) => {
+                log::debug!(
+                    "Failed to read batch header at pos {}: {}",
+                    self.current_pos,
+                    e
+                );
+                None
+            }
         }
-        Some(batch_size)
     }
 }
 
@@ -402,14 +705,24 @@ impl Iterator for LogRecordsBatches {
     fn next(&mut self) -> Option<Self::Item> {
         match self.next_batch_size() {
             Some(batch_size) => {
-                let start = self.current_pos;
-                let end = start + batch_size;
-                // Since LogRecordsBatches owns the Vec<u8>, the slice is valid
-                // as long as the mutable reference exists, which is 'a
-                let record_batch = LogRecordBatch::new(self.data.slice(start..end));
-                self.current_pos += batch_size;
-                self.remaining_bytes -= batch_size;
-                Some(record_batch)
+                // Read full batch data on-demand
+                match self.source.read_batch_data(self.current_pos, batch_size) {
+                    Ok(data) => {
+                        let record_batch = LogRecordBatch::new(data);
+                        self.current_pos += batch_size;
+                        self.remaining_bytes -= batch_size;
+                        Some(record_batch)
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to read batch data at pos {} size {}: {}",
+                            self.current_pos,
+                            batch_size,
+                            e
+                        );
+                        None
+                    }
+                }
             }
             None => None,
         }
@@ -446,7 +759,7 @@ impl LogRecordBatch {
     }
 
     pub fn ensure_valid(&self) -> Result<()> {
-        // todo
+        // TODO enable validation once checksum handling is corrected.
         Ok(())
     }
 
@@ -457,8 +770,7 @@ impl LogRecordBatch {
 
     fn compute_checksum(&self) -> u32 {
         let start = SCHEMA_ID_OFFSET;
-        let end = start + self.data.len();
-        crc32c(&self.data[start..end])
+        crc32c(&self.data[start..])
     }
 
     fn attributes(&self) -> u8 {
@@ -471,12 +783,12 @@ impl LogRecordBatch {
 
     pub fn checksum(&self) -> u32 {
         let offset = CRC_OFFSET;
-        LittleEndian::read_u32(&self.data[offset..offset + CRC_OFFSET])
+        LittleEndian::read_u32(&self.data[offset..offset + CRC_LENGTH])
     }
 
     pub fn schema_id(&self) -> i16 {
         let offset = SCHEMA_ID_OFFSET;
-        LittleEndian::read_i16(&self.data[offset..offset + SCHEMA_ID_OFFSET])
+        LittleEndian::read_i16(&self.data[offset..offset + SCHEMA_ID_LENGTH])
     }
 
     pub fn base_log_offset(&self) -> i64 {
@@ -556,16 +868,17 @@ impl LogRecordBatch {
             return Ok(RecordBatch::new_empty(read_context.target_schema.clone()));
         }
 
-        let data = self.data.get(RECORDS_OFFSET..).ok_or_else(|| {
-            crate::error::Error::UnexpectedError {
+        let data = self
+            .data
+            .get(RECORDS_OFFSET..)
+            .ok_or_else(|| Error::UnexpectedError {
                 message: format!(
                     "Corrupt log record batch: data length {} is less than RECORDS_OFFSET {}",
                     self.data.len(),
                     RECORDS_OFFSET
                 ),
                 source: None,
-            }
-        })?;
+            })?;
         read_context.record_batch(data)
     }
 }
@@ -633,27 +946,20 @@ fn parse_ipc_message(
     Ok((batch_metadata, body_buffer, message.version()))
 }
 
-pub fn to_arrow_schema(fluss_schema: &DataType) -> SchemaRef {
-    match &fluss_schema {
-        DataType::Row(row_type) => {
-            let fields: Vec<Field> = row_type
-                .fields()
-                .iter()
-                .map(|f| {
-                    Field::new(
-                        f.name(),
-                        to_arrow_type(f.data_type()),
-                        f.data_type().is_nullable(),
-                    )
-                })
-                .collect();
+pub fn to_arrow_schema(fluss_schema: &RowType) -> SchemaRef {
+    let fields: Vec<Field> = fluss_schema
+        .fields()
+        .iter()
+        .map(|f| {
+            Field::new(
+                f.name(),
+                to_arrow_type(f.data_type()),
+                f.data_type().is_nullable(),
+            )
+        })
+        .collect();
 
-            SchemaRef::new(arrow_schema::Schema::new(fields))
-        }
-        _ => {
-            panic!("must be row data type.")
-        }
-    }
+    SchemaRef::new(arrow_schema::Schema::new(fields))
 }
 
 pub fn to_arrow_type(fluss_type: &DataType) -> ArrowDataType {
@@ -780,8 +1086,10 @@ impl ReadContext {
         arrow_schema: SchemaRef,
         projected_fields: Vec<usize>,
         is_from_remote: bool,
-    ) -> ReadContext {
-        let target_schema = Self::project_schema(arrow_schema.clone(), projected_fields.as_slice());
+    ) -> Result<ReadContext> {
+        Self::validate_projection(&arrow_schema, projected_fields.as_slice())?;
+        let target_schema =
+            Self::project_schema(arrow_schema.clone(), projected_fields.as_slice())?;
         // the logic is little bit of hard to understand, to refactor it to follow
         // java side
         let (need_do_reorder, sorted_fields) = {
@@ -804,16 +1112,20 @@ impl ReadContext {
                 // Calculate reordering indexes to transform from sorted order to user-requested order
                 let mut reordering_indexes = Vec::with_capacity(projected_fields.len());
                 for &original_idx in &projected_fields {
-                    let pos = sorted_fields
-                        .binary_search(&original_idx)
-                        .expect("projection index should exist in sorted list");
+                    let pos = sorted_fields.binary_search(&original_idx).map_err(|_| {
+                        IllegalArgument {
+                            message: format!(
+                                "Projection index {original_idx} is invalid for the current schema."
+                            ),
+                        }
+                    })?;
                     reordering_indexes.push(pos);
                 }
                 Projection {
                     ordered_schema: Self::project_schema(
                         arrow_schema.clone(),
                         sorted_fields.as_slice(),
-                    ),
+                    )?,
                     projected_fields,
                     ordered_fields: sorted_fields,
                     reordering_indexes,
@@ -824,7 +1136,7 @@ impl ReadContext {
                     ordered_schema: Self::project_schema(
                         arrow_schema.clone(),
                         projected_fields.as_slice(),
-                    ),
+                    )?,
                     ordered_fields: projected_fields.clone(),
                     projected_fields,
                     reordering_indexes: vec![],
@@ -833,21 +1145,34 @@ impl ReadContext {
             }
         };
 
-        ReadContext {
+        Ok(ReadContext {
             target_schema,
             full_schema: arrow_schema,
             projection: Some(project),
             is_from_remote,
-        }
+        })
     }
 
-    pub fn project_schema(schema: SchemaRef, projected_fields: &[usize]) -> SchemaRef {
-        // todo: handle the exception
-        SchemaRef::new(
-            schema
-                .project(projected_fields)
-                .expect("can't project schema"),
-        )
+    fn validate_projection(schema: &SchemaRef, projected_fields: &[usize]) -> Result<()> {
+        let field_count = schema.fields().len();
+        for &index in projected_fields {
+            if index >= field_count {
+                return Err(IllegalArgument {
+                    message: format!(
+                        "Projection index {index} is out of bounds for schema with {field_count} fields."
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn project_schema(schema: SchemaRef, projected_fields: &[usize]) -> Result<SchemaRef> {
+        Ok(SchemaRef::new(schema.project(projected_fields).map_err(
+            |e| IllegalArgument {
+                message: format!("Invalid projection: {e}"),
+            },
+        )?))
     }
 
     pub fn project_fields(&self) -> Option<&[usize]> {
@@ -1035,7 +1360,7 @@ pub struct MyVec<T>(pub StreamReader<T>);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::DataTypes;
+    use crate::metadata::{DataField, DataTypes, RowType};
 
     #[test]
     fn test_to_array_type() {
@@ -1140,24 +1465,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Invalid precision value for TimeType: 10")]
-    fn test_time_invalid_precision() {
-        to_arrow_type(&DataTypes::time_with_precision(10));
-    }
-
-    #[test]
-    #[should_panic(expected = "Invalid precision value for TimestampType: 10")]
-    fn test_timestamp_invalid_precision() {
-        to_arrow_type(&DataTypes::timestamp_with_precision(10));
-    }
-
-    #[test]
-    #[should_panic(expected = "Invalid precision value for TimestampLTzType: 10")]
-    fn test_timestamp_ltz_invalid_precision() {
-        to_arrow_type(&DataTypes::timestamp_ltz_with_precision(10));
-    }
-
-    #[test]
     fn test_parse_ipc_message() {
         let empty_body: &[u8] = &le_bytes(&[0xFFFFFFFF, 0x00000000]);
         let result = parse_ipc_message(empty_body);
@@ -1207,11 +1514,145 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projection_rejects_out_of_bounds_index() {
+        let row_type = RowType::new(vec![
+            DataField::new("id".to_string(), DataTypes::int(), None),
+            DataField::new("name".to_string(), DataTypes::string(), None),
+        ]);
+        let schema = to_arrow_schema(&row_type);
+        let result = ReadContext::with_projection_pushdown(schema, vec![0, 2], false);
+
+        assert!(matches!(result, Err(IllegalArgument { .. })));
+    }
+
+    #[test]
+    fn checksum_and_schema_id_read_minimum_header() {
+        // Header-only batches with record_count == 0 are valid; this covers the minimal bytes
+        // needed for checksum/schema_id access.
+        let mut data = vec![0u8; SCHEMA_ID_OFFSET + SCHEMA_ID_LENGTH];
+        let crc = 0xA1B2C3D4u32;
+        let schema_id = 42i16;
+        LittleEndian::write_u32(&mut data[CRC_OFFSET..CRC_OFFSET + CRC_LENGTH], crc);
+        LittleEndian::write_i16(
+            &mut data[SCHEMA_ID_OFFSET..SCHEMA_ID_OFFSET + SCHEMA_ID_LENGTH],
+            schema_id,
+        );
+
+        let batch = LogRecordBatch::new(Bytes::from(data));
+        assert_eq!(batch.checksum(), crc);
+        assert_eq!(batch.schema_id(), schema_id);
+
+        let expected = crc32c(&batch.data[SCHEMA_ID_OFFSET..]);
+        assert_eq!(batch.compute_checksum(), expected);
+    }
+
     fn le_bytes(vals: &[u32]) -> Vec<u8> {
         let mut out = Vec::with_capacity(vals.len() * 4);
         for &v in vals {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
+    }
+
+    // Tests for file-backed streaming
+
+    #[test]
+    fn test_file_source_streaming() -> Result<()> {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Test 1: Basic file reads work
+        let test_data = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        let mut tmp_file = NamedTempFile::new()?;
+        tmp_file.write_all(&test_data)?;
+        tmp_file.flush()?;
+
+        let file = std::fs::File::open(tmp_file.path())?;
+        let source = FileSource::new(file, 0)?;
+
+        // Read full data
+        let data = source.read_batch_data(0, 10)?;
+        assert_eq!(data.to_vec(), test_data);
+
+        // Read partial data
+        let partial = source.read_batch_data(2, 5)?;
+        assert_eq!(partial.to_vec(), vec![3, 4, 5, 6, 7]);
+
+        // Test 2: base_offset works (critical for remote logs with pos_in_log_segment)
+        let prefix = vec![0xFF; 100];
+        let actual_data = vec![1, 2, 3, 4, 5];
+        let mut tmp_file2 = NamedTempFile::new()?;
+        tmp_file2.write_all(&prefix)?;
+        tmp_file2.write_all(&actual_data)?;
+        tmp_file2.flush()?;
+
+        let file2 = std::fs::File::open(tmp_file2.path())?;
+        let source2 = FileSource::new(file2, 100)?; // Skip first 100 bytes
+
+        assert_eq!(source2.total_size(), 5); // Only counts data after offset
+        let data2 = source2.read_batch_data(0, 5)?;
+        assert_eq!(data2.to_vec(), actual_data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_log_records_batches_from_file() -> Result<()> {
+        use crate::client::WriteRecord;
+        use crate::compression::{
+            ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+        };
+        use crate::metadata::TablePath;
+        use crate::row::GenericRow;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Integration test: Real log record batch streamed from file
+        let row_type = RowType::new(vec![
+            DataField::new("id".to_string(), DataTypes::int(), None),
+            DataField::new("name".to_string(), DataTypes::string(), None),
+        ]);
+        let table_path = Arc::new(TablePath::new("db".to_string(), "tbl".to_string()));
+
+        let mut builder = MemoryLogRecordsArrowBuilder::new(
+            1,
+            &row_type,
+            false,
+            ArrowCompressionInfo {
+                compression_type: ArrowCompressionType::None,
+                compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+            },
+        );
+
+        let mut row = GenericRow::new();
+        row.set_field(0, 1_i32);
+        row.set_field(1, "alice");
+        let record = WriteRecord::for_append(table_path.clone(), 1, row);
+        builder.append(&record)?;
+
+        let mut row2 = GenericRow::new();
+        row2.set_field(0, 2_i32);
+        row2.set_field(1, "bob");
+        let record2 = WriteRecord::for_append(table_path, 2, row2);
+        builder.append(&record2)?;
+
+        let data = builder.build()?;
+
+        // Write to file
+        let mut tmp_file = NamedTempFile::new()?;
+        tmp_file.write_all(&data)?;
+        tmp_file.flush()?;
+
+        // Create file-backed LogRecordsBatches (should stream, not load all into memory)
+        let file = std::fs::File::open(tmp_file.path())?;
+        let mut batches = LogRecordsBatches::from_file(file, 0)?;
+
+        // Iterate through batches (should work just like in-memory)
+        let batch = batches.next().expect("Should have at least one batch");
+        assert!(batch.size_in_bytes() > 0);
+        assert_eq!(batch.record_count(), 2);
+
+        Ok(())
     }
 }

@@ -15,14 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Result;
+//! Key-Value record and batch implementations.
 
-fn main() -> Result<()> {
-    let mut config = prost_build::Config::new();
-    config.bytes([
-        ".proto.PbProduceLogReqForBucket.records",
-        ".proto.PbPutKvReqForBucket.records",
-    ]);
-    config.compile_protos(&["src/proto/fluss_api.proto"], &["src/proto"])?;
-    Ok(())
-}
+mod kv_record;
+mod kv_record_batch;
+mod kv_record_batch_builder;
+mod kv_record_read_context;
+mod read_context;
+
+#[cfg(test)]
+mod test_util;
+
+pub use kv_record::{KvRecord, LENGTH_LENGTH as KV_RECORD_LENGTH_LENGTH};
+pub use kv_record_batch::*;
+pub use kv_record_batch_builder::*;
+pub use kv_record_read_context::{KvRecordReadContext, SchemaGetter};
+pub use read_context::ReadContext;
+
+/// Current KV magic value
+pub const CURRENT_KV_MAGIC_VALUE: u8 = 0;
+
+/// No writer ID constant
+pub const NO_WRITER_ID: i64 = -1;
+
+/// No batch sequence constant
+pub const NO_BATCH_SEQUENCE: i32 = -1;

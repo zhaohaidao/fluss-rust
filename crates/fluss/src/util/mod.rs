@@ -16,12 +16,12 @@
 // under the License.
 
 pub mod murmur_hash;
+pub mod varint;
 
 use crate::metadata::TableBucket;
 use linked_hash_map::LinkedHashMap;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -32,11 +32,9 @@ pub fn current_time_ms() -> i64 {
         .as_millis() as i64
 }
 
-pub async fn delete_file(file_path: PathBuf) {
-    tokio::fs::remove_file(&file_path)
-        .await
-        .unwrap_or_else(|err| log::warn!("Could not delete file: {file_path:?}, error: {err:?}"));
-}
+// Removed: delete_file() is no longer used.
+// File cleanup is now handled via RAII with FileCleanupGuard in arrow.rs
+// which uses Rust's drop order to ensure files are closed before deletion.
 
 pub struct FairBucketStatusMap<S> {
     map: LinkedHashMap<TableBucket, Arc<S>>,
@@ -181,5 +179,59 @@ impl<S> FairBucketStatusMap<S> {
 impl<S> Default for FairBucketStatusMap<S> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn fair_bucket_status_map_tracks_order_and_size() {
+        let bucket0 = TableBucket::new(1, 0);
+        let bucket1 = TableBucket::new(1, 1);
+
+        let mut map = FairBucketStatusMap::new();
+        map.update_and_move_to_end(bucket0.clone(), 10);
+        map.update_and_move_to_end(bucket1.clone(), 20);
+        assert_eq!(map.size(), 2);
+
+        let values: Vec<i32> = map
+            .bucket_status_values()
+            .into_iter()
+            .map(|value| **value)
+            .collect();
+        assert_eq!(values, vec![10, 20]);
+
+        map.move_to_end(bucket0.clone());
+        let values: Vec<i32> = map
+            .bucket_status_values()
+            .into_iter()
+            .map(|value| **value)
+            .collect();
+        assert_eq!(values, vec![20, 10]);
+    }
+
+    #[test]
+    fn fair_bucket_status_map_mutations() {
+        let bucket0 = TableBucket::new(1, 0);
+        let bucket1 = TableBucket::new(2, 1);
+
+        let mut map = FairBucketStatusMap::new();
+        let mut input = HashMap::new();
+        input.insert(bucket0.clone(), Arc::new(1));
+        input.insert(bucket1.clone(), Arc::new(2));
+        map.set(input);
+
+        assert!(map.contains(&bucket0));
+        assert!(map.contains(&bucket1));
+        assert_eq!(map.bucket_set().len(), 2);
+
+        map.remove(&bucket1);
+        assert_eq!(map.size(), 1);
+
+        map.clear();
+        assert_eq!(map.size(), 0);
     }
 }

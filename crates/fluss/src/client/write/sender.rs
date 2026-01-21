@@ -17,11 +17,16 @@
 
 use crate::client::broadcast;
 use crate::client::metadata::Metadata;
+use crate::client::write::batch::WriteBatch;
 use crate::client::{ReadyWriteBatch, RecordAccumulator};
+use crate::error::Error::UnexpectedError;
 use crate::error::{FlussError, Result};
 use crate::metadata::{TableBucket, TablePath};
-use crate::proto::ProduceLogResponse;
-use crate::rpc::message::ProduceLogRequest;
+use crate::proto::{
+    PbProduceLogRespForBucket, PbPutKvRespForBucket, ProduceLogResponse, PutKvResponse,
+};
+use crate::rpc::ServerConnection;
+use crate::rpc::message::{ProduceLogRequest, PutKvRequest};
 use log::warn;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
@@ -178,54 +183,44 @@ impl Sender {
         };
 
         for (table_id, table_buckets) in write_batch_by_table {
-            let request_batches: Vec<&ReadyWriteBatch> = table_buckets
+            let mut request_batches: Vec<ReadyWriteBatch> = table_buckets
                 .iter()
-                .filter_map(|bucket| records_by_bucket.get(bucket))
+                .filter_map(|bucket| records_by_bucket.remove(bucket))
                 .collect();
+
             if request_batches.is_empty() {
                 continue;
             }
-            let request = match ProduceLogRequest::new(
+
+            let write_request = match Self::build_write_request(
                 table_id,
                 acks,
                 self.max_request_timeout_ms,
-                request_batches.as_slice(),
+                &mut request_batches,
             ) {
-                Ok(request) => request,
+                Ok(req) => req,
                 Err(e) => {
                     self.handle_batches_with_local_error(
-                        table_buckets
-                            .iter()
-                            .filter_map(|bucket| records_by_bucket.remove(bucket))
-                            .collect(),
-                        format!("Failed to build produce request: {e}"),
+                        request_batches,
+                        format!("Failed to build write request: {e}"),
                     )
                     .await?;
                     continue;
                 }
             };
 
-            let response = match connection.request(request).await {
-                Ok(response) => response,
-                Err(e) => {
-                    self.handle_batches_with_error(
-                        table_buckets
-                            .iter()
-                            .filter_map(|bucket| records_by_bucket.remove(bucket))
-                            .collect(),
-                        FlussError::NetworkException,
-                        format!("Failed to send produce request: {e}"),
-                    )
-                    .await?;
-                    continue;
-                }
-            };
+            // let's put in back into records_by_bucket
+            // since response handle will use it.
+            for request_batch in request_batches {
+                records_by_bucket.insert(request_batch.table_bucket.clone(), request_batch);
+            }
 
-            self.handle_produce_response(
+            self.send_and_handle_response(
+                &connection,
+                write_request,
                 table_id,
                 &table_buckets,
                 &mut records_by_bucket,
-                response,
             )
             .await?;
         }
@@ -233,50 +228,120 @@ impl Sender {
         Ok(())
     }
 
-    async fn handle_produce_response(
+    fn build_write_request(
+        table_id: i64,
+        acks: i16,
+        timeout_ms: i32,
+        request_batches: &mut [ReadyWriteBatch],
+    ) -> Result<WriteRequest> {
+        let first_batch = &request_batches.first().unwrap().write_batch;
+
+        let request = match first_batch {
+            WriteBatch::ArrowLog(_) => {
+                let req = ProduceLogRequest::new(table_id, acks, timeout_ms, request_batches)?;
+                WriteRequest::ProduceLog(req)
+            }
+            WriteBatch::Kv(kv_write_batch) => {
+                let target_columns = kv_write_batch.target_columns();
+                for batch in request_batches.iter().skip(1) {
+                    match &batch.write_batch {
+                        WriteBatch::ArrowLog(_) => {
+                            return Err(UnexpectedError {
+                                message: "Expecting KvWriteBatch but found ArrowLogWriteBatch"
+                                    .to_string(),
+                                source: None,
+                            });
+                        }
+                        WriteBatch::Kv(kvb) => {
+                            if target_columns != kvb.target_columns() {
+                                return Err(UnexpectedError {
+                                    message: format!(
+                                        "All the write batches to make put kv request should have the same target columns, but got {:?} and {:?}.",
+                                        target_columns,
+                                        kvb.target_columns()
+                                    ),
+                                    source: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                let cols = target_columns
+                    .map(|arc| arc.iter().map(|&c| c as i32).collect())
+                    .unwrap_or_default();
+                let req = PutKvRequest::new(table_id, acks, timeout_ms, cols, request_batches)?;
+                WriteRequest::PutKv(req)
+            }
+        };
+
+        Ok(request)
+    }
+
+    async fn send_and_handle_response(
+        &self,
+        connection: &ServerConnection,
+        write_request: WriteRequest,
+        table_id: i64,
+        table_buckets: &[TableBucket],
+        records_by_bucket: &mut HashMap<TableBucket, ReadyWriteBatch>,
+    ) -> Result<()> {
+        macro_rules! send {
+            ($request:expr) => {
+                match connection.request($request).await {
+                    Ok(response) => {
+                        self.handle_write_response(
+                            table_id,
+                            table_buckets,
+                            records_by_bucket,
+                            response,
+                        )
+                        .await
+                    }
+                    Err(e) => {
+                        self.handle_batches_with_error(
+                            table_buckets
+                                .iter()
+                                .filter_map(|b| records_by_bucket.remove(b))
+                                .collect(),
+                            FlussError::NetworkException,
+                            format!("Failed to send write request: {e}"),
+                        )
+                        .await
+                    }
+                }
+            };
+        }
+
+        match write_request {
+            WriteRequest::ProduceLog(req) => send!(req),
+            WriteRequest::PutKv(req) => send!(req),
+        }
+    }
+
+    async fn handle_write_response<R: WriteResponse>(
         &self,
         table_id: i64,
         request_buckets: &[TableBucket],
         records_by_bucket: &mut HashMap<TableBucket, ReadyWriteBatch>,
-        response: ProduceLogResponse,
+        response: R,
     ) -> Result<()> {
         let mut invalid_metadata_tables: HashSet<TablePath> = HashSet::new();
         let mut pending_buckets: HashSet<TableBucket> = request_buckets.iter().cloned().collect();
-        for produce_log_response_for_bucket in response.buckets_resp.iter() {
-            let tb = TableBucket::new(table_id, produce_log_response_for_bucket.bucket_id);
 
+        for bucket_resp in response.buckets_resp() {
+            let tb = TableBucket::new(table_id, bucket_resp.bucket_id());
             let Some(ready_batch) = records_by_bucket.remove(&tb) else {
                 panic!("Missing ready batch for table bucket {tb}");
             };
             pending_buckets.remove(&tb);
 
-            if let Some(error_code) = produce_log_response_for_bucket.error_code {
-                if error_code == FlussError::None.code() {
-                    self.complete_batch(ready_batch);
-                    continue;
-                }
-
-                let error = FlussError::for_code(error_code);
-                let message = produce_log_response_for_bucket
-                    .error_message
-                    .clone()
-                    .unwrap_or_else(|| error.message().to_string());
-                if let Some(table_path) = self
-                    .handle_write_batch_error(ready_batch, error, message)
-                    .await?
-                {
-                    invalid_metadata_tables.insert(table_path);
-                }
-            } else {
-                self.complete_batch(ready_batch)
-            }
-        }
-        if !pending_buckets.is_empty() {
-            for bucket in pending_buckets {
-                if let Some(ready_batch) = records_by_bucket.remove(&bucket) {
-                    let message =
-                        format!("Missing response for table bucket {bucket} in produce response.");
-                    let error = FlussError::UnknownServerError;
+            match bucket_resp.error_code() {
+                Some(code) if code != FlussError::None.code() => {
+                    let error = FlussError::for_code(code);
+                    let message = bucket_resp
+                        .error_message()
+                        .cloned()
+                        .unwrap_or_else(|| error.message().to_string());
                     if let Some(table_path) = self
                         .handle_write_batch_error(ready_batch, error, message)
                         .await?
@@ -284,8 +349,25 @@ impl Sender {
                         invalid_metadata_tables.insert(table_path);
                     }
                 }
+                _ => self.complete_batch(ready_batch),
             }
         }
+
+        for bucket in pending_buckets {
+            if let Some(ready_batch) = records_by_bucket.remove(&bucket) {
+                if let Some(table_path) = self
+                    .handle_write_batch_error(
+                        ready_batch,
+                        FlussError::UnknownServerError,
+                        format!("Missing response for table bucket {bucket}"),
+                    )
+                    .await?
+                {
+                    invalid_metadata_tables.insert(table_path);
+                }
+            }
+        }
+
         self.update_metadata_if_needed(invalid_metadata_tables)
             .await;
         Ok(())
@@ -444,6 +526,60 @@ impl Sender {
     }
 }
 
+enum WriteRequest {
+    ProduceLog(ProduceLogRequest),
+    PutKv(PutKvRequest),
+}
+
+trait BucketResponse {
+    fn bucket_id(&self) -> i32;
+    fn error_code(&self) -> Option<i32>;
+    fn error_message(&self) -> Option<&String>;
+}
+
+impl BucketResponse for PbProduceLogRespForBucket {
+    fn bucket_id(&self) -> i32 {
+        self.bucket_id
+    }
+    fn error_code(&self) -> Option<i32> {
+        self.error_code
+    }
+    fn error_message(&self) -> Option<&String> {
+        self.error_message.as_ref()
+    }
+}
+
+impl BucketResponse for PbPutKvRespForBucket {
+    fn bucket_id(&self) -> i32 {
+        self.bucket_id
+    }
+    fn error_code(&self) -> Option<i32> {
+        self.error_code
+    }
+    fn error_message(&self) -> Option<&String> {
+        self.error_message.as_ref()
+    }
+}
+
+trait WriteResponse {
+    type BucketResp: BucketResponse;
+    fn buckets_resp(&self) -> &[Self::BucketResp];
+}
+
+impl WriteResponse for ProduceLogResponse {
+    type BucketResp = PbProduceLogRespForBucket;
+    fn buckets_resp(&self) -> &[Self::BucketResp] {
+        &self.buckets_resp
+    }
+}
+
+impl WriteResponse for PutKvResponse {
+    type BucketResp = PbPutKvRespForBucket;
+    fn buckets_resp(&self) -> &[Self::BucketResp] {
+        &self.buckets_resp
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,15 +591,16 @@ mod tests {
     use crate::row::{Datum, GenericRow};
     use crate::rpc::FlussError;
     use crate::test_utils::build_cluster_arc;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     async fn build_ready_batch(
         accumulator: &RecordAccumulator,
         cluster: Arc<Cluster>,
         table_path: Arc<TablePath>,
     ) -> Result<(ReadyWriteBatch, crate::client::ResultHandle)> {
-        let record = WriteRecord::new(
+        let record = WriteRecord::for_append(
             table_path,
+            1,
             GenericRow {
                 values: vec![Datum::Int32(1)],
             },
@@ -556,7 +693,7 @@ mod tests {
         };
 
         sender
-            .handle_produce_response(1, &request_buckets, &mut records_by_bucket, response)
+            .handle_write_response(1, &request_buckets, &mut records_by_bucket, response)
             .await?;
 
         let batch_result = handle.wait().await?;

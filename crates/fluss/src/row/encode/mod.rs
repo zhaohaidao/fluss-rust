@@ -16,11 +16,13 @@
 // under the License.
 
 mod compacted_key_encoder;
+mod compacted_row_encoder;
 
 use crate::error::Result;
-use crate::metadata::{DataLakeFormat, RowType};
-use crate::row::InternalRow;
+use crate::metadata::{DataLakeFormat, KvFormat, RowType};
 use crate::row::encode::compacted_key_encoder::CompactedKeyEncoder;
+use crate::row::encode::compacted_row_encoder::CompactedRowEncoder;
+use crate::row::{Datum, InternalRow};
 use bytes::Bytes;
 
 /// An interface for encoding key of row into bytes.
@@ -29,8 +31,9 @@ pub trait KeyEncoder {
     fn encode_key(&mut self, row: &dyn InternalRow) -> Result<Bytes>;
 }
 
-#[allow(dead_code)]
-impl dyn KeyEncoder {
+pub struct KeyEncoderFactory;
+
+impl KeyEncoderFactory {
     /// Create a key encoder to encode the key bytes of the input row.
     /// # Arguments
     /// * `row_type` - the row type of the input row
@@ -41,24 +44,84 @@ impl dyn KeyEncoder {
     /// key encoder
     pub fn of(
         row_type: &RowType,
-        key_fields: Vec<String>,
-        data_lake_format: Option<DataLakeFormat>,
+        key_fields: &[String],
+        data_lake_format: &Option<DataLakeFormat>,
     ) -> Result<Box<dyn KeyEncoder>> {
         match data_lake_format {
             Some(DataLakeFormat::Paimon) => {
                 unimplemented!("KeyEncoder for Paimon format is currently unimplemented")
             }
             Some(DataLakeFormat::Lance) => Ok(Box::new(CompactedKeyEncoder::create_key_encoder(
-                row_type,
-                key_fields.as_slice(),
+                row_type, key_fields,
             )?)),
             Some(DataLakeFormat::Iceberg) => {
                 unimplemented!("KeyEncoder for Iceberg format is currently unimplemented")
             }
             None => Ok(Box::new(CompactedKeyEncoder::create_key_encoder(
-                row_type,
-                key_fields.as_slice(),
+                row_type, key_fields,
             )?)),
+        }
+    }
+}
+
+/// An encoder to write [`BinaryRow`]. It's used to write row
+/// multi-times one by one. When writing a new row:
+///
+/// 1. call method [`RowEncoder::start_new_row()`] to start the writing.
+/// 2. call method [`RowEncoder::encode_field()`] to write the row's field.
+/// 3. call method [`RowEncoder::finishRow()`] to finish the writing and get the written row.
+#[allow(dead_code)]
+pub trait RowEncoder {
+    /// Start to write a new row.
+    ///
+    /// # Returns
+    /// * Ok(()) if successful
+    fn start_new_row(&mut self) -> Result<()>;
+
+    /// Write the row's field in given pos with given value.
+    ///
+    /// # Arguments
+    /// * pos - the position of the field to write.
+    /// * value - the value of the field to write.
+    ///
+    /// # Returns
+    /// * Ok(()) if successful
+    fn encode_field(&mut self, pos: usize, value: Datum) -> Result<()>;
+
+    /// Finish write the row, returns the written row.
+    ///
+    /// Note that returned row borrows from [`RowEncoder`]'s internal buffer which is reused for subsequent rows
+    /// [`RowEncoder::start_new_row()`] should only be called after the returned row goes out of scope.
+    ///
+    /// # Returns
+    /// * the written row
+    fn finish_row(&mut self) -> Result<Bytes>;
+
+    /// Closes the row encoder
+    ///
+    /// # Returns
+    /// * Ok(()) if successful
+    fn close(&mut self) -> Result<()>;
+}
+
+#[allow(dead_code)]
+pub struct RowEncoderFactory {}
+
+#[allow(dead_code)]
+impl RowEncoderFactory {
+    pub fn create(kv_format: KvFormat, row_type: RowType) -> Result<impl RowEncoder> {
+        Self::create_for_field_types(kv_format, row_type)
+    }
+
+    pub fn create_for_field_types(
+        kv_format: KvFormat,
+        row_type: RowType,
+    ) -> Result<impl RowEncoder> {
+        match kv_format {
+            KvFormat::INDEXED => {
+                todo!()
+            }
+            KvFormat::COMPACTED => CompactedRowEncoder::new(row_type),
         }
     }
 }

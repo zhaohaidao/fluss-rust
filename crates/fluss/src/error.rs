@@ -21,6 +21,7 @@ pub use crate::rpc::{ApiError, FlussError};
 use arrow_schema::ArrowError;
 use snafu::Snafu;
 use std::{io, result};
+use strum::ParseError;
 
 pub type Result<T> = result::Result<T, Error>;
 
@@ -100,6 +101,11 @@ pub enum Error {
 
     #[snafu(
         visibility(pub(crate)),
+        display("Fluss hitting wakeup error {}.", message)
+    )]
+    WakeupError { message: String },
+    #[snafu(
+        visibility(pub(crate)),
         display("Fluss hitting unsupported operation error {}.", message)
     )]
     UnsupportedOperation { message: String },
@@ -153,5 +159,13 @@ impl From<opendal::Error> for Error {
 impl From<ApiError> for Error {
     fn from(value: ApiError) -> Self {
         Error::FlussAPIError { api_error: value }
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(value: ParseError) -> Self {
+        Error::IllegalArgument {
+            message: value.to_string(),
+        }
     }
 }

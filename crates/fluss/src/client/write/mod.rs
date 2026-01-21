@@ -24,38 +24,123 @@ use crate::metadata::TablePath;
 use crate::row::GenericRow;
 pub use accumulator::*;
 use arrow::array::RecordBatch;
+use bytes::Bytes;
 use std::sync::Arc;
 
 pub(crate) mod broadcast;
 mod bucket_assigner;
 
 mod sender;
+mod write_format;
 mod writer_client;
 
+pub use write_format::WriteFormat;
 pub use writer_client::WriterClient;
 
+#[allow(dead_code)]
 pub struct WriteRecord<'a> {
-    pub row: Record<'a>,
-    pub table_path: Arc<TablePath>,
-}
-
-pub enum Record<'a> {
-    Row(GenericRow<'a>),
-    RecordBatch(Arc<RecordBatch>),
+    record: Record<'a>,
+    table_path: Arc<TablePath>,
+    bucket_key: Option<Bytes>,
+    schema_id: i32,
+    write_format: WriteFormat,
 }
 
 impl<'a> WriteRecord<'a> {
-    pub fn new(table_path: Arc<TablePath>, row: GenericRow<'a>) -> Self {
-        Self {
-            row: Record::Row(row),
-            table_path,
+    pub fn record(&self) -> &Record<'a> {
+        &self.record
+    }
+}
+
+pub enum Record<'a> {
+    Log(LogWriteRecord<'a>),
+    Kv(KvWriteRecord<'a>),
+}
+
+pub enum LogWriteRecord<'a> {
+    Generic(GenericRow<'a>),
+    RecordBatch(Arc<RecordBatch>),
+}
+
+#[derive(Clone)]
+pub enum RowBytes<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Bytes),
+}
+
+impl<'a> RowBytes<'a> {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            RowBytes::Borrowed(slice) => slice,
+            RowBytes::Owned(bytes) => bytes.as_ref(),
+        }
+    }
+}
+
+pub struct KvWriteRecord<'a> {
+    key: Bytes,
+    target_columns: Option<Arc<Vec<usize>>>,
+    row_bytes: Option<RowBytes<'a>>,
+}
+
+impl<'a> KvWriteRecord<'a> {
+    fn new(
+        key: Bytes,
+        target_columns: Option<Arc<Vec<usize>>>,
+        row_bytes: Option<RowBytes<'a>>,
+    ) -> Self {
+        KvWriteRecord {
+            key,
+            target_columns,
+            row_bytes,
         }
     }
 
-    pub fn new_record_batch(table_path: Arc<TablePath>, row: RecordBatch) -> Self {
+    pub fn row_bytes(&self) -> Option<&[u8]> {
+        self.row_bytes.as_ref().map(|rb| rb.as_slice())
+    }
+}
+
+impl<'a> WriteRecord<'a> {
+    pub fn for_append(table_path: Arc<TablePath>, schema_id: i32, row: GenericRow<'a>) -> Self {
         Self {
-            row: Record::RecordBatch(Arc::new(row)),
+            record: Record::Log(LogWriteRecord::Generic(row)),
             table_path,
+            bucket_key: None,
+            schema_id,
+            write_format: WriteFormat::ArrowLog,
+        }
+    }
+
+    pub fn for_append_record_batch(
+        table_path: Arc<TablePath>,
+        schema_id: i32,
+        row: RecordBatch,
+    ) -> Self {
+        Self {
+            record: Record::Log(LogWriteRecord::RecordBatch(Arc::new(row))),
+            table_path,
+            bucket_key: None,
+            schema_id,
+            write_format: WriteFormat::ArrowLog,
+        }
+    }
+
+    pub fn for_upsert(
+        table_path: Arc<TablePath>,
+        schema_id: i32,
+        key: Bytes,
+        bucket_key: Option<Bytes>,
+        write_format: WriteFormat,
+        target_columns: Option<Arc<Vec<usize>>>,
+        row_bytes: Option<RowBytes<'a>>,
+    ) -> Self {
+        Self {
+            record: Record::Kv(KvWriteRecord::new(key, target_columns, row_bytes)),
+            table_path,
+            bucket_key,
+            schema_id,
+            write_format,
         }
     }
 }
