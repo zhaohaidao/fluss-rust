@@ -527,6 +527,8 @@ impl Table {
     }
 
     fn new_log_scanner(&self) -> Result<*mut LogScanner, String> {
+        let _enter = RUNTIME.enter();
+
         let fluss_table = fcore::client::FlussTable::new(
             &self.connection,
             self.metadata.clone(),
@@ -545,6 +547,8 @@ impl Table {
         &self,
         column_indices: Vec<usize>,
     ) -> Result<*mut LogScanner, String> {
+        let _enter = RUNTIME.enter();
+
         let fluss_table = fcore::client::FlussTable::new(
             &self.connection,
             self.metadata.clone(),
