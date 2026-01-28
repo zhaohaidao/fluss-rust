@@ -104,6 +104,12 @@ add_executable(fluss_cpp_consume_table examples/consume_table.cpp)
 target_link_libraries(fluss_cpp_consume_table fluss_cpp)
 target_include_directories(fluss_cpp_consume_table PUBLIC ${CPP_INCLUDE_DIR})
 
+set_source_files_properties(examples/custom_consume_table.pp PROPERTIES LANGUAGE CXX)
+add_executable(fluss_cpp_custom_consume_table examples/custom_consume_table.pp)
+target_link_libraries(fluss_cpp_custom_consume_table fluss_cpp)
+target_include_directories(fluss_cpp_custom_consume_table PUBLIC ${CPP_INCLUDE_DIR})
+target_link_libraries(fluss_cpp_custom_consume_table stdc++fs)
+
 set_target_properties(fluss_cpp
     PROPERTIES ADDITIONAL_CLEAN_FILES ${CARGO_TARGET_DIR}
 )

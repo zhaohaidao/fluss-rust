@@ -50,7 +50,9 @@ use std::{
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
+    sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 use crate::error::Error::IllegalArgument;
@@ -79,6 +81,153 @@ pub const LAST_OFFSET_DELTA_OFFSET: usize = ATTRIBUTES_OFFSET + ATTRIBUTE_LENGTH
 pub const WRITE_CLIENT_ID_OFFSET: usize = LAST_OFFSET_DELTA_OFFSET + LAST_OFFSET_DELTA_LENGTH;
 pub const BATCH_SEQUENCE_OFFSET: usize = WRITE_CLIENT_ID_OFFSET + WRITE_CLIENT_ID_LENGTH;
 pub const RECORDS_COUNT_OFFSET: usize = BATCH_SEQUENCE_OFFSET + BATCH_SEQUENCE_LENGTH;
+
+const ARROW_METRICS_ENV: &str = "FLUSS_ARROW_METRICS";
+const ARROW_METRICS_INTERVAL_ENV: &str = "FLUSS_ARROW_METRICS_INTERVAL_MS";
+const ARROW_METRICS_REPORT_EVERY: u64 = 200;
+const ARROW_METRICS_DEFAULT_INTERVAL_NS: u64 = 10_000_000_000;
+
+struct ArrowDecodeMetrics {
+    batches: AtomicU64,
+    rows: AtomicU64,
+    bytes: AtomicU64,
+    decode_ns: AtomicU64,
+    last_report_batches: AtomicU64,
+    last_report_rows: AtomicU64,
+    last_report_bytes: AtomicU64,
+    last_report_decode_ns: AtomicU64,
+    last_report_ns: AtomicU64,
+    report_interval_ns: AtomicU64,
+    report_lock: Mutex<()>,
+}
+
+impl ArrowDecodeMetrics {
+    fn new() -> Self {
+        Self {
+            batches: AtomicU64::new(0),
+            rows: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            decode_ns: AtomicU64::new(0),
+            last_report_batches: AtomicU64::new(0),
+            last_report_rows: AtomicU64::new(0),
+            last_report_bytes: AtomicU64::new(0),
+            last_report_decode_ns: AtomicU64::new(0),
+            last_report_ns: AtomicU64::new(0),
+            report_interval_ns: AtomicU64::new(ARROW_METRICS_DEFAULT_INTERVAL_NS),
+            report_lock: Mutex::new(()),
+        }
+    }
+
+    fn observe(&self, rows: u64, bytes: u64, decode_ns: u64) {
+        let batch_count = self.batches.fetch_add(1, Ordering::Relaxed) + 1;
+        self.rows.fetch_add(rows, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.decode_ns.fetch_add(decode_ns, Ordering::Relaxed);
+
+        let now_ns = arrow_metrics_now_ns();
+        let last_report_ns = self.last_report_ns.load(Ordering::Relaxed);
+        let interval_ns = self.report_interval_ns.load(Ordering::Relaxed);
+        let time_due = now_ns.saturating_sub(last_report_ns) >= interval_ns;
+        let count_due = batch_count % ARROW_METRICS_REPORT_EVERY == 0;
+        if !time_due && !count_due {
+            return;
+        }
+
+        let _guard = match self.report_lock.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+
+        let total_batches = self.batches.load(Ordering::Relaxed);
+        let now_ns = arrow_metrics_now_ns();
+        let last_report_ns = self.last_report_ns.load(Ordering::Relaxed);
+        let interval_ns = self.report_interval_ns.load(Ordering::Relaxed);
+        let time_due = now_ns.saturating_sub(last_report_ns) >= interval_ns;
+        let count_due = total_batches % ARROW_METRICS_REPORT_EVERY == 0;
+        if !time_due && !count_due {
+            return;
+        }
+
+        let total_rows = self.rows.load(Ordering::Relaxed);
+        let total_bytes = self.bytes.load(Ordering::Relaxed);
+        let total_decode_ns = self.decode_ns.load(Ordering::Relaxed);
+
+        let last_batches = self.last_report_batches.swap(total_batches, Ordering::Relaxed);
+        let last_rows = self.last_report_rows.swap(total_rows, Ordering::Relaxed);
+        let last_bytes = self.last_report_bytes.swap(total_bytes, Ordering::Relaxed);
+        let last_decode_ns = self
+            .last_report_decode_ns
+            .swap(total_decode_ns, Ordering::Relaxed);
+        let last_report_ns = self.last_report_ns.swap(now_ns, Ordering::Relaxed);
+
+        let delta_batches = total_batches.saturating_sub(last_batches);
+        if delta_batches == 0 {
+            return;
+        }
+        let delta_rows = total_rows.saturating_sub(last_rows);
+        let delta_bytes = total_bytes.saturating_sub(last_bytes);
+        let delta_decode_ns = total_decode_ns.saturating_sub(last_decode_ns);
+        let window_ns = now_ns.saturating_sub(last_report_ns).max(1);
+
+        let rows_per_s = (delta_rows as f64) * 1_000_000_000.0 / (window_ns as f64);
+        let mb_per_s =
+            (delta_bytes as f64) * 1_000_000_000.0 / (window_ns as f64) / (1024.0 * 1024.0);
+        let avg_decode_ms = (delta_decode_ns as f64) / (delta_batches as f64) / 1_000_000.0;
+        let decode_util = (delta_decode_ns as f64) * 100.0 / (window_ns as f64);
+
+        log::info!(
+            "arrow_decode batches={} rows={} mb={:.2} rows_per_s={:.2} mb_per_s={:.2} avg_decode_ms={:.2} decode_util={:.1}%",
+            delta_batches,
+            delta_rows,
+            delta_bytes as f64 / (1024.0 * 1024.0),
+            rows_per_s,
+            mb_per_s,
+            avg_decode_ms,
+            decode_util
+        );
+    }
+}
+
+fn arrow_metrics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(ARROW_METRICS_ENV)
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                v == "1" || v == "true" || v == "yes"
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn arrow_metrics_interval_ns() -> u64 {
+    static INTERVAL_NS: OnceLock<u64> = OnceLock::new();
+    *INTERVAL_NS.get_or_init(|| {
+        std::env::var(ARROW_METRICS_INTERVAL_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|ms| ms.saturating_mul(1_000_000))
+            .filter(|&ns| ns > 0)
+            .unwrap_or(ARROW_METRICS_DEFAULT_INTERVAL_NS)
+    })
+}
+
+fn arrow_metrics_start() -> &'static Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now)
+}
+
+fn arrow_metrics_now_ns() -> u64 {
+    arrow_metrics_start().elapsed().as_nanos() as u64
+}
+
+fn arrow_metrics() -> &'static ArrowDecodeMetrics {
+    static METRICS: OnceLock<ArrowDecodeMetrics> = OnceLock::new();
+    let metrics = METRICS.get_or_init(ArrowDecodeMetrics::new);
+    let interval_ns = arrow_metrics_interval_ns();
+    metrics.report_interval_ns.store(interval_ns, Ordering::Relaxed);
+    metrics
+}
 pub const RECORDS_OFFSET: usize = RECORDS_COUNT_OFFSET + RECORDS_COUNT_LENGTH;
 
 pub const RECORD_BATCH_HEADER_SIZE: usize = RECORDS_OFFSET;
@@ -1251,6 +1400,11 @@ impl ReadContext {
     }
 
     pub fn record_batch(&self, data: &[u8]) -> Result<RecordBatch> {
+        let decode_start = if arrow_metrics_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let (batch_metadata, body_buffer, version) = parse_ipc_message(data)?;
 
         let resolve_schema = {
@@ -1308,10 +1462,20 @@ impl ReadContext {
             }
             _ => record_batch,
         };
+        if let Some(start) = decode_start {
+            let elapsed = start.elapsed().as_nanos() as u64;
+            let bytes = record_batch.get_array_memory_size() as u64;
+            arrow_metrics().observe(record_batch.num_rows() as u64, bytes, elapsed);
+        }
         Ok(record_batch)
     }
 
     pub fn record_batch_for_remote_log(&self, data: &[u8]) -> Result<Option<RecordBatch>> {
+        let decode_start = if arrow_metrics_enabled() {
+            Some(Instant::now())
+        } else {
+            None
+        };
         let (batch_metadata, body_buffer, version) = parse_ipc_message(data)?;
 
         let record_batch = read_record_batch(
@@ -1334,6 +1498,11 @@ impl ReadContext {
             }
             None => record_batch,
         };
+        if let Some(start) = decode_start {
+            let elapsed = start.elapsed().as_nanos() as u64;
+            let bytes = record_batch.get_array_memory_size() as u64;
+            arrow_metrics().observe(record_batch.num_rows() as u64, bytes, elapsed);
+        }
         Ok(Some(record_batch))
     }
 }

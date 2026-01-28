@@ -27,6 +27,7 @@ version = { workspace = true }
 fluss = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
+env_logger = { workspace = true }
 [[example]]
 name = "example-table"
 path = "src/example_table.rs"
@@ -34,3 +35,7 @@ path = "src/example_table.rs"
 [[example]]
 name = "example-upsert-lookup"
 path = "src/example_kv_table.rs"
+
+[[example]]
+name = "custom-consume-table"
+path = "src/custom_consume_table.rs"
