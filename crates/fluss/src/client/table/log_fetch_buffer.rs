@@ -18,15 +18,22 @@
 use arrow::array::RecordBatch;
 use parking_lot::Mutex;
 
+use crate::client::table::remote_log::{
+    PrefetchPermit, RemoteLogDownloadFuture, RemoteLogFile, RemoteLogSegment,
+};
 use crate::error::{ApiError, Error, Result};
 use crate::metadata::TableBucket;
 use crate::record::{
     LogRecordBatch, LogRecordIterator, LogRecordsBatches, ReadContext, ScanRecord,
 };
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio::sync::Notify;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +65,7 @@ pub trait CompletedFetch: Send + Sync {
     fn fetch_error_context(&self) -> Option<&FetchErrorContext>;
     fn take_error(&mut self) -> Option<Error>;
     fn fetch_records(&mut self, max_records: usize) -> Result<Vec<ScanRecord>>;
-    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<RecordBatch>>;
+    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>>;
     fn is_consumed(&self) -> bool;
     fn records_read(&self) -> usize;
     fn drain(&mut self);
@@ -106,7 +113,7 @@ impl LogFetchBuffer {
     /// Wait for the buffer to become non-empty, with timeout.
     /// Returns true if data became available, false if timeout.
     pub async fn await_not_empty(&self, timeout: Duration) -> Result<bool> {
-        let deadline = std::time::Instant::now() + timeout;
+        let deadline = Instant::now() + timeout;
 
         loop {
             // Check if buffer is not empty
@@ -122,7 +129,7 @@ impl LogFetchBuffer {
             }
 
             // Check if timeout
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if now >= deadline {
                 return Ok(false);
             }
@@ -442,7 +449,8 @@ impl DefaultCompletedFetch {
                 if record.offset() >= self.next_fetch_offset {
                     return Ok(Some(record));
                 }
-            } else if let Some(batch) = self.log_record_batch.next() {
+            } else if let Some(batch_result) = self.log_record_batch.next() {
+                let batch = batch_result?;
                 self.current_record_iterator = Some(batch.records(&self.read_context)?);
                 self.current_record_batch = Some(batch);
             } else {
@@ -468,14 +476,16 @@ impl DefaultCompletedFetch {
             source: None,
         }
     }
-    /// Get the next batch directly without row iteration
-    fn next_fetched_batch(&mut self) -> Result<Option<RecordBatch>> {
+    /// Get the next batch with its base offset.
+    /// Returns (RecordBatch, base_offset) where base_offset is the offset of the first record.
+    fn next_fetched_batch(&mut self) -> Result<Option<(RecordBatch, i64)>> {
         loop {
-            let Some(log_batch) = self.log_record_batch.next() else {
+            let Some(log_batch_result) = self.log_record_batch.next() else {
                 self.drain();
                 return Ok(None);
             };
 
+            let log_batch = log_batch_result?;
             let mut record_batch = log_batch.record_batch(&self.read_context)?;
 
             // Skip empty batches
@@ -483,20 +493,23 @@ impl DefaultCompletedFetch {
                 continue;
             }
 
-            // Truncate batch
-            let base_offset = log_batch.base_log_offset();
-            if self.next_fetch_offset > base_offset {
-                let skip_count = (self.next_fetch_offset - base_offset) as usize;
+            // Calculate the effective base offset for this batch
+            let log_base_offset = log_batch.base_log_offset();
+            let effective_base_offset = if self.next_fetch_offset > log_base_offset {
+                let skip_count = (self.next_fetch_offset - log_base_offset) as usize;
                 if skip_count >= record_batch.num_rows() {
                     continue;
                 }
                 // Slice the batch to skip the first skip_count rows
                 record_batch = record_batch.slice(skip_count, record_batch.num_rows() - skip_count);
-            }
+                self.next_fetch_offset
+            } else {
+                log_base_offset
+            };
 
             self.next_fetch_offset = log_batch.next_log_offset();
             self.records_read += record_batch.num_rows();
-            return Ok(Some(record_batch));
+            return Ok(Some((record_batch, effective_base_offset)));
         }
     }
 }
@@ -576,7 +589,7 @@ impl CompletedFetch for DefaultCompletedFetch {
         Ok(scan_records)
     }
 
-    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<RecordBatch>> {
+    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -598,7 +611,7 @@ impl CompletedFetch for DefaultCompletedFetch {
 
         for _ in 0..max_batches {
             match self.next_fetched_batch()? {
-                Some(batch) => batches.push(batch),
+                Some(batch_with_offset) => batches.push(batch_with_offset),
                 None => break,
             }
         }
@@ -650,14 +663,11 @@ impl CompletedFetch for DefaultCompletedFetch {
 /// Holds RAII permit until consumed (data is in inner)
 pub struct RemoteCompletedFetch {
     inner: DefaultCompletedFetch,
-    permit: Option<crate::client::table::remote_log::PrefetchPermit>,
+    permit: Option<PrefetchPermit>,
 }
 
 impl RemoteCompletedFetch {
-    pub fn new(
-        inner: DefaultCompletedFetch,
-        permit: crate::client::table::remote_log::PrefetchPermit,
-    ) -> Self {
+    pub fn new(inner: DefaultCompletedFetch, permit: PrefetchPermit) -> Self {
         Self {
             inner,
             permit: Some(permit),
@@ -686,7 +696,7 @@ impl CompletedFetch for RemoteCompletedFetch {
         self.inner.fetch_records(max_records)
     }
 
-    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<RecordBatch>> {
+    fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
         self.inner.fetch_batches(max_batches)
     }
 
@@ -729,8 +739,8 @@ impl CompletedFetch for RemoteCompletedFetch {
 
 /// Pending fetch that waits for remote log file to be downloaded
 pub struct RemotePendingFetch {
-    segment: crate::client::table::remote_log::RemoteLogSegment,
-    download_future: crate::client::table::remote_log::RemoteLogDownloadFuture,
+    segment: RemoteLogSegment,
+    download_future: RemoteLogDownloadFuture,
     pos_in_log_segment: i32,
     fetch_offset: i64,
     high_watermark: i64,
@@ -739,8 +749,8 @@ pub struct RemotePendingFetch {
 
 impl RemotePendingFetch {
     pub fn new(
-        segment: crate::client::table::remote_log::RemoteLogSegment,
-        download_future: crate::client::table::remote_log::RemoteLogDownloadFuture,
+        segment: RemoteLogSegment,
+        download_future: RemoteLogDownloadFuture,
         pos_in_log_segment: i32,
         fetch_offset: i64,
         high_watermark: i64,
@@ -769,7 +779,7 @@ impl PendingFetch for RemotePendingFetch {
     fn to_completed_fetch(self: Box<Self>) -> Result<Box<dyn CompletedFetch>> {
         // Take the RemoteLogFile and destructure
         let remote_log_file = self.download_future.take_remote_log_file()?;
-        let crate::client::table::remote_log::RemoteLogFile {
+        let RemoteLogFile {
             file_path,
             file_size: _,
             permit,
@@ -782,18 +792,15 @@ impl PendingFetch for RemotePendingFetch {
         // Create file-backed LogRecordsBatches with cleanup (streaming!)
         // Data will be read batch-by-batch on-demand, not all at once
         // FileSource will delete the file when dropped (after file is closed)
-        let log_record_batch = LogRecordsBatches::from_file_with_cleanup(
-            file,
-            self.pos_in_log_segment as usize,
-            file_path.clone(),
-        )?;
+        let log_record_batch =
+            LogRecordsBatches::from_file(file, self.pos_in_log_segment as usize, file_path)?;
 
         // Calculate size based on position offset
         let size_in_bytes = if self.pos_in_log_segment > 0 {
             let pos = self.pos_in_log_segment as usize;
             if pos >= file_size {
                 return Err(Error::UnexpectedError {
-                    message: format!("Position {} exceeds file size {}", pos, file_size),
+                    message: format!("Position {pos} exceeds file size {file_size}"),
                     source: None,
                 });
             }
@@ -813,7 +820,8 @@ impl PendingFetch for RemotePendingFetch {
         );
 
         // Wrap it with RemoteCompletedFetch to hold the permit
-        // Permit will delete the file when dropped
+        // Permit manages the prefetch slot (releases semaphore and notifies coordinator) when dropped;
+        // file deletion is handled by FileCleanupGuard in the file-backed source created via from_file
         Ok(Box::new(RemoteCompletedFetch::new(inner_fetch, permit)))
     }
 }
@@ -829,15 +837,14 @@ mod tests {
     use crate::record::{MemoryLogRecordsArrowBuilder, ReadContext, to_arrow_schema};
     use crate::row::GenericRow;
     use std::sync::Arc;
-    use std::time::Duration;
 
-    fn test_read_context() -> ReadContext {
+    fn test_read_context() -> Result<ReadContext> {
         let row_type = RowType::new(vec![DataField::new(
             "id".to_string(),
             DataTypes::int(),
             None,
         )]);
-        ReadContext::new(to_arrow_schema(&row_type), false)
+        Ok(ReadContext::new(to_arrow_schema(&row_type)?, false))
     }
 
     struct ErrorPendingFetch {
@@ -863,7 +870,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_not_empty_returns_wakeup_error() {
-        let buffer = LogFetchBuffer::new(test_read_context());
+        let buffer = LogFetchBuffer::new(test_read_context().unwrap());
         buffer.wakeup();
 
         let result = buffer.await_not_empty(Duration::from_millis(10)).await;
@@ -872,7 +879,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_not_empty_returns_pending_error() {
-        let buffer = LogFetchBuffer::new(test_read_context());
+        let buffer = LogFetchBuffer::new(test_read_context().unwrap());
         let table_bucket = TableBucket::new(1, 0);
         buffer.pend(Box::new(ErrorPendingFetch {
             table_bucket: table_bucket.clone(),
@@ -902,9 +909,9 @@ mod tests {
                 compression_type: ArrowCompressionType::None,
                 compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
             },
-        );
+        )?;
 
-        let mut row = GenericRow::new();
+        let mut row = GenericRow::new(2);
         row.set_field(0, 1_i32);
         row.set_field(1, "alice");
         let record = WriteRecord::for_append(table_path, 1, row);
@@ -912,7 +919,7 @@ mod tests {
 
         let data = builder.build()?;
         let log_records = LogRecordsBatches::new(data.clone());
-        let read_context = ReadContext::new(to_arrow_schema(&row_type), false);
+        let read_context = ReadContext::new(to_arrow_schema(&row_type)?, false);
         let mut fetch = DefaultCompletedFetch::new(
             TableBucket::new(1, 0),
             log_records,

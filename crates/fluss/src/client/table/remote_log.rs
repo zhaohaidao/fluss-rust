@@ -19,13 +19,22 @@ use crate::io::{FileIO, Storage};
 use crate::metadata::TableBucket;
 use crate::proto::{PbRemoteLogFetchInfo, PbRemoteLogSegment};
 use parking_lot::{Mutex, RwLock};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
-use std::future::Future;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::sync::Arc;
+use std::{
+    cmp::{Ordering, Reverse, min},
+    collections::{BinaryHeap, HashMap},
+    future::Future,
+    io, mem,
+    path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
+
+#[cfg(test)]
+use std::{
+    env,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -176,7 +185,7 @@ impl Drop for PrefetchPermit {
 }
 
 /// Downloaded remote log file with prefetch permit
-/// File remains on disk for memory efficiency - permit cleanup deletes it
+/// File remains on disk for memory efficiency; file deletion is handled by FileCleanupGuard in FileSource
 #[derive(Debug)]
 pub struct RemoteLogFile {
     /// Path to the downloaded file on local disk
@@ -185,7 +194,7 @@ pub struct RemoteLogFile {
     /// Currently unused but kept for potential future use (logging, metrics, etc.)
     #[allow(dead_code)]
     pub file_size: usize,
-    /// RAII permit that will delete the file when dropped
+    /// RAII permit that releases prefetch semaphore slot and notifies coordinator when dropped
     pub permit: PrefetchPermit,
 }
 
@@ -211,7 +220,7 @@ impl RemoteLogDownloadRequest {
 // Primary: Java semantics (timestamp cross-bucket, offset within-bucket)
 // Tie-breakers: table_bucket fields (table_id, partition_id, bucket_id), then segment_id
 impl Ord for RemoteLogDownloadRequest {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         if self.segment.table_bucket == other.segment.table_bucket {
             // Same bucket: order by start_offset (ascending - earlier segments first)
             self.segment
@@ -248,14 +257,14 @@ impl Ord for RemoteLogDownloadRequest {
 }
 
 impl PartialOrd for RemoteLogDownloadRequest {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
 impl PartialEq for RemoteLogDownloadRequest {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == std::cmp::Ordering::Equal
+        self.cmp(other) == Ordering::Equal
     }
 }
 
@@ -460,7 +469,7 @@ async fn spawn_download_task(
                 result_sender: request.result_sender,
             }
         }
-        Err(e) if request.result_sender.is_closed() => {
+        Err(_e) if request.result_sender.is_closed() => {
             // Receiver dropped (cancelled) - release permit, don't re-queue
             drop(permit);
             DownloadResult::Cancelled
@@ -482,8 +491,7 @@ async fn spawn_download_task(
                 DownloadResult::FailedPermanently {
                     error: Error::UnexpectedError {
                         message: format!(
-                            "Failed to download remote log segment after {} retries: {}",
-                            retry_count, e
+                            "Failed to download remote log segment after {retry_count} retries: {e}"
                         ),
                         source: Some(Box::new(e)),
                     },
@@ -576,7 +584,7 @@ async fn coordinator_loop(
                         // Cancelled - permit already released, nothing to do
                     }
                     Err(e) => {
-                        log::error!("Download task panicked: {:?}", e);
+                        log::error!("Download task panicked: {e:?}");
                         // Permit already released via RAII
                     }
                 }
@@ -637,7 +645,7 @@ impl RemoteLogDownloadFuture {
             // This also ensures that any callbacks registered after this point will be called immediately
             let callbacks: Vec<CompletionCallback> = {
                 let mut callbacks_guard = callbacks_clone.lock();
-                std::mem::take(&mut *callbacks_guard)
+                mem::take(&mut *callbacks_guard)
             };
             for callback in callbacks {
                 callback();
@@ -708,13 +716,16 @@ impl RemoteLogDownloadFuture {
     }
 }
 
-/// Downloader for remote log segment files
+/// Downloader for remote log segment files.
+///
+/// # Shutdown behavior
+///
+/// When the downloader is dropped, the request channel closes, signaling the coordinator
+/// to stop accepting new work. The coordinator will finish any in-flight downloads but
+/// won't wait for completion. Pending futures will fail.
 pub struct RemoteLogDownloader {
     request_sender: Option<mpsc::UnboundedSender<RemoteLogDownloadRequest>>,
     remote_fs_props: Option<Arc<RwLock<HashMap<String, String>>>>,
-    /// Handle to the coordinator task. Used for graceful shutdown via shutdown() method.
-    #[allow(dead_code)]
-    coordinator_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RemoteLogDownloader {
@@ -729,30 +740,14 @@ impl RemoteLogDownloader {
             local_log_dir: Arc::new(local_log_dir),
         });
 
-        let (request_sender, request_receiver) = mpsc::unbounded_channel();
-
-        let coordinator = DownloadCoordinator {
-            download_queue: BinaryHeap::new(),
-            active_downloads: JoinSet::new(),
-            in_flight: 0,
-            prefetch_semaphore: Arc::new(Semaphore::new(max_prefetch_segments)),
-            max_concurrent_downloads,
-            recycle_notify: Arc::new(Notify::new()),
-            fetcher,
-        };
-
-        let coordinator_handle = tokio::spawn(coordinator_loop(coordinator, request_receiver));
-
-        Ok(Self {
-            request_sender: Some(request_sender),
-            remote_fs_props: Some(remote_fs_props),
-            coordinator_handle: Some(coordinator_handle),
-        })
+        let mut downloader =
+            Self::new_with_fetcher(fetcher, max_prefetch_segments, max_concurrent_downloads)?;
+        downloader.remote_fs_props = Some(remote_fs_props);
+        Ok(downloader)
     }
 
-    /// Create a RemoteLogDownloader with a custom fetcher (for testing)
-    /// The remote_fs_props will be None since custom fetchers typically don't need S3 credentials
-    #[cfg(test)]
+    /// Create a RemoteLogDownloader with a custom fetcher (for testing).
+    /// The remote_fs_props will be None since custom fetchers typically don't need S3 credentials.
     pub fn new_with_fetcher(
         fetcher: Arc<dyn RemoteLogFetcher>,
         max_prefetch_segments: usize,
@@ -770,29 +765,13 @@ impl RemoteLogDownloader {
             fetcher,
         };
 
-        let coordinator_handle = tokio::spawn(coordinator_loop(coordinator, request_receiver));
+        // Spawn coordinator task - it will exit when request_sender is dropped
+        tokio::spawn(coordinator_loop(coordinator, request_receiver));
 
         Ok(Self {
             request_sender: Some(request_sender),
             remote_fs_props: None,
-            coordinator_handle: Some(coordinator_handle),
         })
-    }
-
-    /// Gracefully shutdown the downloader
-    /// Closes the request channel and waits for coordinator to finish pending work
-    ///
-    /// Note: This consumes self to prevent use-after-shutdown
-    #[allow(dead_code)]
-    pub async fn shutdown(mut self) {
-        // Drop the request_sender to close the channel
-        drop(self.request_sender.take());
-
-        // Wait for coordinator to finish gracefully
-        // Coordinator will exit when: recv() returns None && queue empty && joinset empty
-        if let Some(handle) = self.coordinator_handle.take() {
-            let _ = handle.await;
-        }
     }
 
     pub fn set_remote_fs_props(&self, props: HashMap<String, String>) {
@@ -836,20 +815,11 @@ impl RemoteLogDownloader {
 
 impl Drop for RemoteLogDownloader {
     fn drop(&mut self) {
-        // Drop the request sender to signal coordinator shutdown
+        // Drop the request sender to signal coordinator shutdown.
         // This causes request_receiver.recv() to return None, allowing the
         // coordinator to exit gracefully after processing pending work.
+        // The coordinator task will finish on its own when it sees the channel closed.
         drop(self.request_sender.take());
-
-        // Note: We cannot await in Drop (sync context), so we can't wait for
-        // the coordinator to finish. Pending futures will fail when they detect
-        // the coordinator has exited (via closed channel).
-        //
-        // For graceful shutdown with waiting, use `shutdown().await` instead.
-
-        // We don't abort the coordinator handle anymore - let it finish naturally.
-        // The JoinHandle will be dropped here, which detaches the task.
-        // The coordinator will exit on its own when it sees the channel closed.
     }
 }
 
@@ -890,7 +860,7 @@ impl RemoteLogDownloader {
         let (op, relative_path) = storage.create(remote_path)?;
 
         // Timeout for remote storage operations (30 seconds)
-        const REMOTE_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+        const REMOTE_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
         // Get file metadata to know the size with timeout
         let meta = op.stat(relative_path).await?;
@@ -907,7 +877,7 @@ impl RemoteLogDownloader {
         let total_chunks = file_size.div_ceil(CHUNK_SIZE);
 
         while offset < file_size {
-            let end = std::cmp::min(offset + CHUNK_SIZE, file_size);
+            let end = min(offset + CHUNK_SIZE, file_size);
             let range = offset..end;
             chunk_count += 1;
 
@@ -1030,18 +1000,18 @@ mod tests {
 
                 if should_fail {
                     Err(Error::UnexpectedError {
-                        message: format!("Fake fetch failed for {}", segment_id),
+                        message: format!("Fake fetch failed for {segment_id}"),
                         source: None,
                     })
                 } else {
                     let fake_data = vec![1, 2, 3, 4];
-                    let temp_dir = std::env::temp_dir();
-                    let timestamp = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
+                    let temp_dir = env::temp_dir();
+                    let timestamp = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_nanos();
                     let file_path =
-                        temp_dir.join(format!("fake_segment_{}_{}.log", segment_id, timestamp));
+                        temp_dir.join(format!("fake_segment_{segment_id}_{timestamp}.log"));
                     tokio::fs::write(&file_path, &fake_data).await?;
 
                     Ok(FetchResult {
@@ -1150,7 +1120,7 @@ mod tests {
 
         // Request 4 segments with same priority (to isolate concurrency limiting from priority)
         let segs: Vec<_> = (0..4)
-            .map(|i| create_segment(&format!("seg{}", i), i * 100, 1000, bucket.clone()))
+            .map(|i| create_segment(&format!("seg{i}"), i * 100, 1000, bucket.clone()))
             .collect();
 
         let _futures: Vec<_> = segs
@@ -1159,7 +1129,7 @@ mod tests {
             .collect();
 
         // Wait for exactly 2 to start
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             fake_fetcher.in_flight(),
             2,
@@ -1168,7 +1138,7 @@ mod tests {
 
         // Release one
         fake_fetcher.release_one();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Max should never exceed 2
         assert_eq!(
@@ -1197,7 +1167,7 @@ mod tests {
 
         // Request 4 downloads
         let segs: Vec<_> = (0..4)
-            .map(|i| create_segment(&format!("seg{}", i), i * 100, 1000, bucket.clone()))
+            .map(|i| create_segment(&format!("seg{i}"), i * 100, 1000, bucket.clone()))
             .collect();
 
         let mut futures: Vec<_> = segs
@@ -1206,7 +1176,7 @@ mod tests {
             .collect();
 
         // Wait for first 2 to complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             if futures.iter().filter(|f| f.is_done()).count() >= 2 {
                 break;
@@ -1214,11 +1184,11 @@ mod tests {
             if tokio::time::Instant::now() > deadline {
                 panic!("Timeout waiting for first 2 downloads");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         // Verify 3rd and 4th are blocked (prefetch limit)
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             futures.iter().filter(|f| f.is_done()).count(),
             2,
@@ -1231,7 +1201,7 @@ mod tests {
         drop(futures);
 
         // 3rd and 4th should now complete
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
             if f3.is_done() && f4.is_done() {
                 break;
@@ -1239,7 +1209,7 @@ mod tests {
             if tokio::time::Instant::now() > deadline {
                 panic!("Timeout after permit release");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -1257,7 +1227,7 @@ mod tests {
         let future = downloader.request_remote_log("dir", &seg);
 
         // Should succeed after retries
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if future.is_done() {
                 break;
@@ -1265,7 +1235,7 @@ mod tests {
             if tokio::time::Instant::now() > deadline {
                 panic!("Timeout waiting for retry to succeed");
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
 
         assert!(future.is_done(), "Should succeed after retries");
@@ -1277,11 +1247,11 @@ mod tests {
             RemoteLogDownloader::new_with_fetcher(fake_fetcher2.clone(), 10, 1).unwrap();
 
         let future2 = downloader2.request_remote_log("dir", &seg2);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Drop to cancel
         drop(future2);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert_eq!(
             fake_fetcher2.in_flight(),

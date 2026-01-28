@@ -15,16 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::RecordBatch;
 use arrow_schema::SchemaRef;
 use log::{debug, warn};
 use parking_lot::{Mutex, RwLock};
-use std::collections::{HashMap, HashSet};
-use std::slice::from_ref;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    slice::from_ref,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 
+use crate::TableId;
 use crate::client::connection::FlussConnection;
 use crate::client::credentials::CredentialsCache;
 use crate::client::metadata::Metadata;
@@ -34,9 +36,11 @@ use crate::client::table::log_fetch_buffer::{
 };
 use crate::client::table::remote_log::{RemoteLogDownloader, RemoteLogFetchInfo};
 use crate::error::{ApiError, Error, FlussError, Result};
-use crate::metadata::{TableBucket, TableInfo, TablePath};
+use crate::metadata::{PhysicalTablePath, TableBucket, TableInfo, TablePath};
 use crate::proto::{ErrorResponse, FetchLogRequest, PbFetchLogReqForBucket, PbFetchLogReqForTable};
-use crate::record::{LogRecordsBatches, ReadContext, ScanRecord, ScanRecords, to_arrow_schema};
+use crate::record::{
+    LogRecordsBatches, ReadContext, ScanBatch, ScanRecord, ScanRecords, to_arrow_schema,
+};
 use crate::rpc::{RpcClient, RpcError, message};
 use crate::util::FairBucketStatusMap;
 
@@ -262,7 +266,7 @@ pub struct RecordBatchLogScanner {
 /// Private shared implementation for both scanner types
 struct LogScannerInner {
     table_path: TablePath,
-    table_id: i64,
+    table_id: TableId,
     metadata: Arc<Metadata>,
     log_scanner_status: Arc<LogScannerStatus>,
     log_fetcher: LogFetcher,
@@ -294,7 +298,7 @@ impl LogScannerInner {
     }
 
     async fn poll_records(&self, timeout: Duration) -> Result<ScanRecords> {
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let deadline = start + timeout;
 
         loop {
@@ -309,7 +313,7 @@ impl LogScannerInner {
             }
 
             // No data available, check if we should wait
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if now >= deadline {
                 // Timeout reached, return empty result
                 return Ok(ScanRecords::new(HashMap::new()));
@@ -377,8 +381,8 @@ impl LogScannerInner {
         self.log_fetcher.collect_fetches()
     }
 
-    async fn poll_batches(&self, timeout: Duration) -> Result<Vec<RecordBatch>> {
-        let start = std::time::Instant::now();
+    async fn poll_batches(&self, timeout: Duration) -> Result<Vec<ScanBatch>> {
+        let start = Instant::now();
         let deadline = start + timeout;
 
         loop {
@@ -389,7 +393,7 @@ impl LogScannerInner {
                 return Ok(batches);
             }
 
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if now >= deadline {
                 return Ok(Vec::new());
             }
@@ -407,7 +411,7 @@ impl LogScannerInner {
         }
     }
 
-    async fn poll_for_batches(&self) -> Result<Vec<RecordBatch>> {
+    async fn poll_for_batches(&self) -> Result<Vec<ScanBatch>> {
         let result = self.log_fetcher.collect_batches()?;
         if !result.is_empty() {
             return Ok(result);
@@ -435,7 +439,8 @@ impl LogScanner {
 
 // Implementation for RecordBatchLogScanner (batches mode)
 impl RecordBatchLogScanner {
-    pub async fn poll(&self, timeout: Duration) -> Result<Vec<RecordBatch>> {
+    /// Poll for batches with metadata (bucket and offset information).
+    pub async fn poll(&self, timeout: Duration) -> Result<Vec<ScanBatch>> {
         self.inner.poll_batches(timeout).await
     }
 
@@ -464,6 +469,16 @@ struct LogFetcher {
     nodes_with_pending_fetch_requests: Arc<Mutex<HashSet<i32>>>,
 }
 
+struct FetchResponseContext {
+    metadata: Arc<Metadata>,
+    log_fetch_buffer: Arc<LogFetchBuffer>,
+    log_scanner_status: Arc<LogScannerStatus>,
+    read_context: ReadContext,
+    remote_read_context: ReadContext,
+    remote_log_downloader: Arc<RemoteLogDownloader>,
+    credentials_cache: Arc<CredentialsCache>,
+}
+
 impl LogFetcher {
     pub fn new(
         table_info: TableInfo,
@@ -473,7 +488,7 @@ impl LogFetcher {
         config: &crate::config::Config,
         projected_fields: Option<Vec<usize>>,
     ) -> Result<Self> {
-        let full_arrow_schema = to_arrow_schema(table_info.get_row_type());
+        let full_arrow_schema = to_arrow_schema(table_info.get_row_type())?;
         let read_context =
             Self::create_read_context(full_arrow_schema.clone(), projected_fields.clone(), false)?;
         let remote_read_context =
@@ -525,7 +540,8 @@ impl LogFetcher {
             | FlussError::LogStorageException
             | FlussError::KvStorageException
             | FlussError::StorageException
-            | FlussError::FencedLeaderEpochException => FetchErrorContext {
+            | FlussError::FencedLeaderEpochException
+            | FlussError::LeaderNotAvailableException => FetchErrorContext {
                 action: FetchErrorAction::Ignore,
                 log_level: FetchErrorLogLevel::Debug,
                 log_message: format!(
@@ -575,6 +591,17 @@ impl LogFetcher {
                 ),
             },
         }
+    }
+
+    fn should_invalidate_table_meta(error: FlussError) -> bool {
+        matches!(
+            error,
+            FlussError::NotLeaderOrFollower
+                | FlussError::LeaderNotAvailableException
+                | FlussError::FencedLeaderEpochException
+                | FlussError::UnknownTableOrBucketException
+                | FlussError::InvalidCoordinatorException
+        )
     }
 
     async fn check_and_update_metadata(&self) -> Result<()> {
@@ -646,6 +673,15 @@ impl LogFetcher {
             let creds_cache = self.credentials_cache.clone();
             let nodes_with_pending = self.nodes_with_pending_fetch_requests.clone();
             let metadata = self.metadata.clone();
+            let response_context = FetchResponseContext {
+                metadata: metadata.clone(),
+                log_fetch_buffer,
+                log_scanner_status,
+                read_context,
+                remote_read_context,
+                remote_log_downloader,
+                credentials_cache: creds_cache,
+            };
             // Spawn async task to handle the fetch request
             // Note: These tasks are not explicitly tracked or cancelled when LogFetcher is dropped.
             // This is acceptable because:
@@ -691,16 +727,7 @@ impl LogFetcher {
                     }
                 };
 
-                Self::handle_fetch_response(
-                    fetch_response,
-                    &log_fetch_buffer,
-                    &log_scanner_status,
-                    &read_context,
-                    &remote_read_context,
-                    &remote_log_downloader,
-                    &creds_cache,
-                )
-                .await;
+                Self::handle_fetch_response(fetch_response, response_context).await;
             });
         }
 
@@ -719,13 +746,18 @@ impl LogFetcher {
     /// Handle fetch response and add completed fetches to buffer
     async fn handle_fetch_response(
         fetch_response: crate::proto::FetchLogResponse,
-        log_fetch_buffer: &Arc<LogFetchBuffer>,
-        log_scanner_status: &Arc<LogScannerStatus>,
-        read_context: &ReadContext,
-        remote_read_context: &ReadContext,
-        remote_log_downloader: &Arc<RemoteLogDownloader>,
-        credentials_cache: &Arc<CredentialsCache>,
+        context: FetchResponseContext,
     ) {
+        let FetchResponseContext {
+            metadata,
+            log_fetch_buffer,
+            log_scanner_status,
+            read_context,
+            remote_read_context,
+            remote_log_downloader,
+            credentials_cache,
+        } = context;
+
         for pb_fetch_log_resp in fetch_response.tables_resp {
             let table_id = pb_fetch_log_resp.table_id;
             let fetch_log_for_buckets = pb_fetch_log_resp.buckets_resp;
@@ -752,6 +784,20 @@ impl LogFetcher {
                     .into();
 
                     let error = FlussError::for_code(error_code);
+                    if Self::should_invalidate_table_meta(error) {
+                        // TODO: Consider triggering table meta invalidation from sender/lookup paths.
+                        let table_id = table_bucket.table_id();
+                        let cluster = metadata.get_cluster();
+                        if let Some(table_path) = cluster.get_table_path_by_id(table_id) {
+                            let physical_tables =
+                                HashSet::from([PhysicalTablePath::of(table_path.clone())]);
+                            metadata.invalidate_physical_table_meta(&physical_tables);
+                        } else {
+                            warn!(
+                                "Table id {table_id} is missing from table_path_by_id while invalidating table metadata"
+                            );
+                        }
+                    }
                     let error_context = Self::describe_fetch_error(
                         error,
                         &table_bucket,
@@ -1090,13 +1136,13 @@ impl LogFetcher {
         }
     }
 
-    /// Collect completed fetches as RecordBatches
-    fn collect_batches(&self) -> Result<Vec<RecordBatch>> {
+    /// Collect completed fetches as ScanBatches (with bucket and offset metadata)
+    fn collect_batches(&self) -> Result<Vec<ScanBatch>> {
         // Limit memory usage with both batch count and byte size constraints.
         // Max 100 batches per poll, but also check total bytes (soft cap ~64MB).
         const MAX_BATCHES: usize = 100;
         const MAX_BYTES: usize = 64 * 1024 * 1024; // 64MB soft cap
-        let mut result: Vec<RecordBatch> = Vec::new();
+        let mut result: Vec<ScanBatch> = Vec::new();
         let mut batches_remaining = MAX_BATCHES;
         let mut bytes_consumed: usize = 0;
 
@@ -1106,17 +1152,19 @@ impl LogFetcher {
 
                 match next_in_line {
                     Some(mut next_fetch) if !next_fetch.is_consumed() => {
-                        let batches =
+                        let scan_batches =
                             self.fetch_batches_from_fetch(&mut next_fetch, batches_remaining)?;
-                        let batch_count = batches.len();
+                        let batch_count = scan_batches.len();
 
-                        if !batches.is_empty() {
+                        if !scan_batches.is_empty() {
                             // Track bytes consumed (soft cap - may exceed by one fetch)
-                            let batch_bytes: usize =
-                                batches.iter().map(|b| b.get_array_memory_size()).sum();
+                            let batch_bytes: usize = scan_batches
+                                .iter()
+                                .map(|sb| sb.batch().get_array_memory_size())
+                                .sum();
                             bytes_consumed += batch_bytes;
 
-                            result.extend(batches);
+                            result.extend(scan_batches);
                             batches_remaining = batches_remaining.saturating_sub(batch_count);
                         }
 
@@ -1170,7 +1218,7 @@ impl LogFetcher {
         &self,
         next_in_line_fetch: &mut Box<dyn CompletedFetch>,
         max_batches: usize,
-    ) -> Result<Vec<RecordBatch>> {
+    ) -> Result<Vec<ScanBatch>> {
         let table_bucket = next_in_line_fetch.table_bucket().clone();
         let current_offset = self.log_scanner_status.get_bucket_offset(&table_bucket);
 
@@ -1186,7 +1234,7 @@ impl LogFetcher {
         let fetch_offset = next_in_line_fetch.next_fetch_offset();
 
         if fetch_offset == current_offset {
-            let batches = next_in_line_fetch.fetch_batches(max_batches)?;
+            let batches_with_offsets = next_in_line_fetch.fetch_batches(max_batches)?;
             let next_fetch_offset = next_in_line_fetch.next_fetch_offset();
 
             if next_fetch_offset > current_offset {
@@ -1194,7 +1242,13 @@ impl LogFetcher {
                     .update_offset(&table_bucket, next_fetch_offset);
             }
 
-            Ok(batches)
+            // Convert to ScanBatch with bucket info
+            Ok(batches_with_offsets
+                .into_iter()
+                .map(|(batch, base_offset)| {
+                    ScanBatch::new(table_bucket.clone(), batch, base_offset)
+                })
+                .collect())
         } else {
             warn!(
                 "Ignoring fetched batches for {table_bucket:?} at offset {fetch_offset} since the current offset is {current_offset}"
@@ -1452,7 +1506,7 @@ mod tests {
                 compression_type: ArrowCompressionType::None,
                 compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
             },
-        );
+        )?;
         let record = WriteRecord::for_append(
             table_path,
             1,
@@ -1485,7 +1539,7 @@ mod tests {
 
         let data = build_records(&table_info, Arc::new(table_path))?;
         let log_records = LogRecordsBatches::new(data.clone());
-        let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type()), false);
+        let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type())?, false);
         let completed =
             DefaultCompletedFetch::new(bucket.clone(), log_records, data.len(), read_context, 0, 0);
         fetcher.log_fetch_buffer.add(Box::new(completed));
@@ -1515,7 +1569,7 @@ mod tests {
         let bucket = TableBucket::new(1, 0);
         let data = build_records(&table_info, Arc::new(table_path))?;
         let log_records = LogRecordsBatches::new(data.clone());
-        let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type()), false);
+        let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type())?, false);
         let mut completed: Box<dyn CompletedFetch> = Box::new(DefaultCompletedFetch::new(
             bucket,
             log_records,
@@ -1588,20 +1642,73 @@ mod tests {
             }],
         };
 
-        LogFetcher::handle_fetch_response(
-            response,
-            &fetcher.log_fetch_buffer,
-            &fetcher.log_scanner_status,
-            &fetcher.read_context,
-            &fetcher.remote_read_context,
-            &fetcher.remote_log_downloader,
-            &fetcher.credentials_cache,
-        )
-        .await;
+        let response_context = FetchResponseContext {
+            metadata: metadata.clone(),
+            log_fetch_buffer: fetcher.log_fetch_buffer.clone(),
+            log_scanner_status: fetcher.log_scanner_status.clone(),
+            read_context: fetcher.read_context.clone(),
+            remote_read_context: fetcher.remote_read_context.clone(),
+            remote_log_downloader: fetcher.remote_log_downloader.clone(),
+            credentials_cache: fetcher.credentials_cache.clone(),
+        };
+
+        LogFetcher::handle_fetch_response(response, response_context).await;
 
         let completed = fetcher.log_fetch_buffer.poll().expect("completed fetch");
         let api_error = completed.api_error().expect("api error");
         assert_eq!(api_error.code, FlussError::AuthorizationException.code());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn handle_fetch_response_invalidates_table_meta() -> Result<()> {
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = build_table_info(table_path.clone(), 1, 1);
+        let cluster = build_cluster_arc(&table_path, 1, 1);
+        let metadata = Arc::new(Metadata::new_for_test(cluster.clone()));
+        let status = Arc::new(LogScannerStatus::new());
+        status.assign_scan_bucket(TableBucket::new(1, 0), 5);
+        let fetcher = LogFetcher::new(
+            table_info.clone(),
+            Arc::new(RpcClient::new()),
+            metadata.clone(),
+            status.clone(),
+            &crate::config::Config::default(),
+            None,
+        )?;
+
+        let bucket = TableBucket::new(1, 0);
+        assert!(metadata.leader_for(&bucket).is_some());
+
+        let response = crate::proto::FetchLogResponse {
+            tables_resp: vec![crate::proto::PbFetchLogRespForTable {
+                table_id: 1,
+                buckets_resp: vec![crate::proto::PbFetchLogRespForBucket {
+                    partition_id: None,
+                    bucket_id: 0,
+                    error_code: Some(FlussError::NotLeaderOrFollower.code()),
+                    error_message: Some("not leader".to_string()),
+                    high_watermark: None,
+                    log_start_offset: None,
+                    remote_log_fetch_info: None,
+                    records: None,
+                }],
+            }],
+        };
+
+        let response_context = FetchResponseContext {
+            metadata: metadata.clone(),
+            log_fetch_buffer: fetcher.log_fetch_buffer.clone(),
+            log_scanner_status: fetcher.log_scanner_status.clone(),
+            read_context: fetcher.read_context.clone(),
+            remote_read_context: fetcher.remote_read_context.clone(),
+            remote_log_downloader: fetcher.remote_log_downloader.clone(),
+            credentials_cache: fetcher.credentials_cache.clone(),
+        };
+
+        LogFetcher::handle_fetch_response(response, response_context).await;
+
+        assert!(metadata.leader_for(&bucket).is_none());
         Ok(())
     }
 }

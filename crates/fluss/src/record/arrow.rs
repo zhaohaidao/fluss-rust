@@ -22,9 +22,12 @@ use crate::metadata::{DataType, RowType};
 use crate::record::{ChangeType, ScanRecord};
 use crate::row::{ColumnarRow, GenericRow};
 use arrow::array::{
-    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Float32Builder, Float64Builder,
-    Int8Builder, Int16Builder, Int32Builder, Int64Builder, StringBuilder, UInt8Builder,
-    UInt16Builder, UInt32Builder, UInt64Builder,
+    ArrayBuilder, ArrayRef, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
+    Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
+    StringBuilder, Time32MillisecondBuilder, Time32SecondBuilder, Time64MicrosecondBuilder,
+    Time64NanosecondBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
+    TimestampNanosecondBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder, UInt32Builder,
+    UInt64Builder,
 };
 use arrow::{
     array::RecordBatch,
@@ -42,9 +45,11 @@ use byteorder::WriteBytesExt;
 use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use crc32c::crc32c;
-use parking_lot::Mutex;
 use std::{
-    io::{Cursor, Seek, SeekFrom, Write},
+    collections::HashMap,
+    fs::File,
+    io::{Cursor, Read, Seek, SeekFrom, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -102,7 +107,7 @@ fn validate_batch_size(batch_size_bytes: i32) -> Result<usize> {
     // Check for negative size (corrupted data)
     if batch_size_bytes < 0 {
         return Err(Error::UnexpectedError {
-            message: format!("Invalid negative batch size: {}", batch_size_bytes),
+            message: format!("Invalid negative batch size: {batch_size_bytes}"),
             source: None,
         });
     }
@@ -115,8 +120,7 @@ fn validate_batch_size(batch_size_bytes: i32) -> Result<usize> {
             .checked_add(LOG_OVERHEAD)
             .ok_or_else(|| Error::UnexpectedError {
                 message: format!(
-                    "Batch size {} + LOG_OVERHEAD {} would overflow",
-                    batch_size_u, LOG_OVERHEAD
+                    "Batch size {batch_size_u} + LOG_OVERHEAD {LOG_OVERHEAD} would overflow"
                 ),
                 source: None,
             })?;
@@ -125,8 +129,7 @@ fn validate_batch_size(batch_size_bytes: i32) -> Result<usize> {
     if total_size > MAX_BATCH_SIZE {
         return Err(Error::UnexpectedError {
             message: format!(
-                "Batch size {} exceeds maximum allowed size {}",
-                total_size, MAX_BATCH_SIZE
+                "Batch size {total_size} exceeds maximum allowed size {MAX_BATCH_SIZE}"
             ),
             source: None,
         });
@@ -161,7 +164,7 @@ pub struct MemoryLogRecordsArrowBuilder {
 }
 
 pub trait ArrowRecordBatchInnerBuilder: Send + Sync {
-    fn build_arrow_record_batch(&self) -> Result<Arc<RecordBatch>>;
+    fn build_arrow_record_batch(&mut self) -> Result<Arc<RecordBatch>>;
 
     fn append(&mut self, row: &GenericRow) -> Result<bool>;
 
@@ -181,7 +184,7 @@ pub struct PrebuiltRecordBatchBuilder {
 }
 
 impl ArrowRecordBatchInnerBuilder for PrebuiltRecordBatchBuilder {
-    fn build_arrow_record_batch(&self) -> Result<Arc<RecordBatch>> {
+    fn build_arrow_record_batch(&mut self) -> Result<Arc<RecordBatch>> {
         Ok(self.arrow_record_batch.as_ref().unwrap().clone())
     }
 
@@ -215,66 +218,129 @@ impl ArrowRecordBatchInnerBuilder for PrebuiltRecordBatchBuilder {
 
 pub struct RowAppendRecordBatchBuilder {
     table_schema: SchemaRef,
-    arrow_column_builders: Mutex<Vec<Box<dyn ArrayBuilder>>>,
+    arrow_column_builders: Vec<Box<dyn ArrayBuilder>>,
     records_count: i32,
 }
 
 impl RowAppendRecordBatchBuilder {
-    pub fn new(row_type: &RowType) -> Self {
-        let schema_ref = to_arrow_schema(row_type);
-        let builders = Mutex::new(
-            schema_ref
-                .fields()
-                .iter()
-                .map(|field| Self::create_builder(field.data_type()))
-                .collect(),
-        );
-        Self {
+    pub fn new(row_type: &RowType) -> Result<Self> {
+        let schema_ref = to_arrow_schema(row_type)?;
+        let builders: Result<Vec<_>> = schema_ref
+            .fields()
+            .iter()
+            .map(|field| Self::create_builder(field.data_type()))
+            .collect();
+        Ok(Self {
             table_schema: schema_ref.clone(),
-            arrow_column_builders: builders,
+            arrow_column_builders: builders?,
             records_count: 0,
-        }
+        })
     }
 
-    fn create_builder(data_type: &arrow_schema::DataType) -> Box<dyn ArrayBuilder> {
+    fn create_builder(data_type: &arrow_schema::DataType) -> Result<Box<dyn ArrayBuilder>> {
         match data_type {
-            arrow_schema::DataType::Int8 => Box::new(Int8Builder::new()),
-            arrow_schema::DataType::Int16 => Box::new(Int16Builder::new()),
-            arrow_schema::DataType::Int32 => Box::new(Int32Builder::new()),
-            arrow_schema::DataType::Int64 => Box::new(Int64Builder::new()),
-            arrow_schema::DataType::UInt8 => Box::new(UInt8Builder::new()),
-            arrow_schema::DataType::UInt16 => Box::new(UInt16Builder::new()),
-            arrow_schema::DataType::UInt32 => Box::new(UInt32Builder::new()),
-            arrow_schema::DataType::UInt64 => Box::new(UInt64Builder::new()),
-            arrow_schema::DataType::Float32 => Box::new(Float32Builder::new()),
-            arrow_schema::DataType::Float64 => Box::new(Float64Builder::new()),
-            arrow_schema::DataType::Boolean => Box::new(BooleanBuilder::new()),
-            arrow_schema::DataType::Utf8 => Box::new(StringBuilder::new()),
-            arrow_schema::DataType::Binary => Box::new(BinaryBuilder::new()),
-            dt => panic!("Unsupported data type: {dt:?}"),
+            arrow_schema::DataType::Int8 => Ok(Box::new(Int8Builder::new())),
+            arrow_schema::DataType::Int16 => Ok(Box::new(Int16Builder::new())),
+            arrow_schema::DataType::Int32 => Ok(Box::new(Int32Builder::new())),
+            arrow_schema::DataType::Int64 => Ok(Box::new(Int64Builder::new())),
+            arrow_schema::DataType::UInt8 => Ok(Box::new(UInt8Builder::new())),
+            arrow_schema::DataType::UInt16 => Ok(Box::new(UInt16Builder::new())),
+            arrow_schema::DataType::UInt32 => Ok(Box::new(UInt32Builder::new())),
+            arrow_schema::DataType::UInt64 => Ok(Box::new(UInt64Builder::new())),
+            arrow_schema::DataType::Float32 => Ok(Box::new(Float32Builder::new())),
+            arrow_schema::DataType::Float64 => Ok(Box::new(Float64Builder::new())),
+            arrow_schema::DataType::Boolean => Ok(Box::new(BooleanBuilder::new())),
+            arrow_schema::DataType::Utf8 => Ok(Box::new(StringBuilder::new())),
+            arrow_schema::DataType::Binary => Ok(Box::new(BinaryBuilder::new())),
+            arrow_schema::DataType::Decimal128(precision, scale) => {
+                let builder = Decimal128Builder::new()
+                    .with_precision_and_scale(*precision, *scale)
+                    .map_err(|e| Error::IllegalArgument {
+                        message: format!(
+                            "Invalid decimal precision {precision} or scale {scale}: {e}"
+                        ),
+                    })?;
+                Ok(Box::new(builder))
+            }
+            arrow_schema::DataType::Date32 => Ok(Box::new(Date32Builder::new())),
+            arrow_schema::DataType::Time32(unit) => match unit {
+                arrow_schema::TimeUnit::Second => Ok(Box::new(Time32SecondBuilder::new())),
+                arrow_schema::TimeUnit::Millisecond => {
+                    Ok(Box::new(Time32MillisecondBuilder::new()))
+                }
+                _ => Err(Error::IllegalArgument {
+                    message: format!(
+                        "Time32 only supports Second and Millisecond units, got: {unit:?}"
+                    ),
+                }),
+            },
+            arrow_schema::DataType::Time64(unit) => match unit {
+                arrow_schema::TimeUnit::Microsecond => {
+                    Ok(Box::new(Time64MicrosecondBuilder::new()))
+                }
+                arrow_schema::TimeUnit::Nanosecond => Ok(Box::new(Time64NanosecondBuilder::new())),
+                _ => Err(Error::IllegalArgument {
+                    message: format!(
+                        "Time64 only supports Microsecond and Nanosecond units, got: {unit:?}"
+                    ),
+                }),
+            },
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Second, _) => {
+                Ok(Box::new(TimestampSecondBuilder::new()))
+            }
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+                Ok(Box::new(TimestampMillisecondBuilder::new()))
+            }
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+                Ok(Box::new(TimestampMicrosecondBuilder::new()))
+            }
+            arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, _) => {
+                Ok(Box::new(TimestampNanosecondBuilder::new()))
+            }
+            dt => Err(Error::IllegalArgument {
+                message: format!("Unsupported data type: {dt:?}"),
+            }),
         }
     }
 }
 
 impl ArrowRecordBatchInnerBuilder for RowAppendRecordBatchBuilder {
-    fn build_arrow_record_batch(&self) -> Result<Arc<RecordBatch>> {
-        let arrays = self
+    fn build_arrow_record_batch(&mut self) -> Result<Arc<RecordBatch>> {
+        let arrays: Result<Vec<ArrayRef>> = self
             .arrow_column_builders
-            .lock()
             .iter_mut()
-            .map(|b| b.finish())
-            .collect::<Vec<ArrayRef>>();
+            .enumerate()
+            .map(|(idx, b)| {
+                let array = b.finish();
+                let expected_type = self.table_schema.field(idx).data_type();
+
+                // Validate array type matches schema
+                if array.data_type() != expected_type {
+                    return Err(Error::IllegalArgument {
+                        message: format!(
+                            "Builder type mismatch at column {}: expected {:?}, got {:?}",
+                            idx,
+                            expected_type,
+                            array.data_type()
+                        ),
+                    });
+                }
+
+                Ok(array)
+            })
+            .collect();
+
         Ok(Arc::new(RecordBatch::try_new(
             self.table_schema.clone(),
-            arrays,
+            arrays?,
         )?))
     }
 
     fn append(&mut self, row: &GenericRow) -> Result<bool> {
         for (idx, value) in row.values.iter().enumerate() {
-            let mut builder_binding = self.arrow_column_builders.lock();
-            let builder = builder_binding.get_mut(idx).unwrap();
-            value.append_to(builder.as_mut())?;
+            let field_type = self.table_schema.field(idx).data_type();
+            let builder = self.arrow_column_builders.get_mut(idx).unwrap();
+            value.append_to(builder.as_mut(), field_type)?;
         }
         self.records_count += 1;
         Ok(true)
@@ -303,15 +369,15 @@ impl MemoryLogRecordsArrowBuilder {
         row_type: &RowType,
         to_append_record_batch: bool,
         arrow_compression_info: ArrowCompressionInfo,
-    ) -> Self {
+    ) -> Result<Self> {
         let arrow_batch_builder: Box<dyn ArrowRecordBatchInnerBuilder> = {
             if to_append_record_batch {
                 Box::new(PrebuiltRecordBatchBuilder::default())
             } else {
-                Box::new(RowAppendRecordBatchBuilder::new(row_type))
+                Box::new(RowAppendRecordBatchBuilder::new(row_type)?)
             }
         };
-        MemoryLogRecordsArrowBuilder {
+        Ok(MemoryLogRecordsArrowBuilder {
             base_log_offset: BUILDER_DEFAULT_OFFSET,
             schema_id,
             magic: CURRENT_LOG_MAGIC_VALUE,
@@ -320,7 +386,7 @@ impl MemoryLogRecordsArrowBuilder {
             is_closed: false,
             arrow_record_batch_builder: arrow_batch_builder,
             arrow_compression_info,
-        }
+        })
     }
 
     pub fn append(&mut self, record: &WriteRecord) -> Result<bool> {
@@ -350,7 +416,7 @@ impl MemoryLogRecordsArrowBuilder {
         self.is_closed = true;
     }
 
-    pub fn build(&self) -> Result<Vec<u8>> {
+    pub fn build(&mut self) -> Result<Vec<u8>> {
         // serialize arrow batch
         let mut arrow_batch_bytes = vec![];
         let table_schema = self.arrow_record_batch_builder.schema();
@@ -421,37 +487,20 @@ pub trait ToArrow {
     fn append_to(&self, builder: &mut dyn ArrayBuilder) -> Result<()>;
 }
 
-/// Abstract source of log record data.
-/// Allows streaming from files or in-memory buffers.
-pub trait LogRecordsSource: Send + Sync {
-    /// Read batch header at given position.
-    /// Returns (base_offset, batch_size) tuple.
-    fn read_batch_header(&self, pos: usize) -> Result<(i64, usize)>;
-
-    /// Read full batch data at given position with given size.
-    /// Returns Bytes that can be zero-copy sliced.
-    fn read_batch_data(&self, pos: usize, size: usize) -> Result<Bytes>;
-
-    /// Total size of the source in bytes.
-    fn total_size(&self) -> usize;
-}
-
-/// In-memory implementation of LogRecordsSource.
+/// In-memory log record source.
 /// Used for local tablet server fetches (existing path).
-pub struct MemorySource {
+struct MemorySource {
     data: Bytes,
 }
 
 impl MemorySource {
-    pub fn new(data: Vec<u8>) -> Self {
+    fn new(data: Vec<u8>) -> Self {
         Self {
             data: Bytes::from(data),
         }
     }
-}
 
-impl LogRecordsSource for MemorySource {
-    fn read_batch_header(&self, pos: usize) -> Result<(i64, usize)> {
+    fn read_batch_header(&mut self, pos: usize) -> Result<(i64, usize)> {
         if pos + LOG_OVERHEAD > self.data.len() {
             return Err(Error::UnexpectedError {
                 message: format!(
@@ -473,7 +522,7 @@ impl LogRecordsSource for MemorySource {
         Ok((base_offset, batch_size))
     }
 
-    fn read_batch_data(&self, pos: usize, size: usize) -> Result<Bytes> {
+    fn read_batch_data(&mut self, pos: usize, size: usize) -> Result<Bytes> {
         if pos + size > self.data.len() {
             return Err(Error::UnexpectedError {
                 message: format!(
@@ -497,7 +546,7 @@ impl LogRecordsSource for MemorySource {
 /// RAII guard that deletes a file when dropped.
 /// Used to ensure file deletion happens AFTER the file handle is closed.
 struct FileCleanupGuard {
-    file_path: std::path::PathBuf,
+    file_path: PathBuf,
 }
 
 impl Drop for FileCleanupGuard {
@@ -515,41 +564,36 @@ impl Drop for FileCleanupGuard {
     }
 }
 
-/// File-backed implementation of LogRecordsSource.
+/// File-backed log record source.
 /// Used for remote log segments downloaded to local disk.
 /// Streams data on-demand instead of loading entire file into memory.
 ///
-/// Uses Mutex<File> with seek + read_exact for cross-platform compatibility.
-/// Access pattern is sequential iteration (single consumer), so mutex overhead is negligible.
-pub struct FileSource {
-    file: Mutex<std::fs::File>,
+/// Uses seek + read_exact for cross-platform compatibility.
+/// Access pattern is sequential iteration (single consumer).
+struct FileSource {
+    file: File,
     file_size: usize,
     base_offset: usize,
     _cleanup: Option<FileCleanupGuard>, // Drops AFTER file (field order matters!)
 }
 
 impl FileSource {
-    /// Create a new FileSource without automatic cleanup.
-    pub fn new(file: std::fs::File, base_offset: usize) -> Result<Self> {
+    /// Create a new FileSource.
+    ///
+    /// The file at `file_path` will be deleted when this FileSource is dropped.
+    fn new(file: File, base_offset: usize, file_path: PathBuf) -> Result<Self> {
         let file_size = file.metadata()?.len() as usize;
-        Ok(Self {
-            file: Mutex::new(file),
-            file_size,
-            base_offset,
-            _cleanup: None,
-        })
-    }
 
-    /// Create a new FileSource that will delete the file when dropped.
-    /// This is used for remote log files that need cleanup.
-    pub fn new_with_cleanup(
-        file: std::fs::File,
-        base_offset: usize,
-        file_path: std::path::PathBuf,
-    ) -> Result<Self> {
-        let file_size = file.metadata()?.len() as usize;
+        // Validate base_offset to prevent underflow in total_size()
+        if base_offset > file_size {
+            return Err(Error::UnexpectedError {
+                message: format!("base_offset ({base_offset}) exceeds file_size ({file_size})"),
+                source: None,
+            });
+        }
+
         Ok(Self {
-            file: Mutex::new(file),
+            file,
             file_size,
             base_offset,
             _cleanup: Some(FileCleanupGuard { file_path }),
@@ -558,17 +602,13 @@ impl FileSource {
 
     /// Read data at a specific position using seek + read_exact.
     /// This is cross-platform and adequate for sequential access patterns.
-    fn read_at(&self, pos: u64, buf: &mut [u8]) -> Result<()> {
-        use std::io::Read;
-        let mut file = self.file.lock();
-        file.seek(SeekFrom::Start(pos))?;
-        file.read_exact(buf)?;
+    fn read_at(&mut self, pos: u64, buf: &mut [u8]) -> Result<()> {
+        self.file.seek(SeekFrom::Start(pos))?;
+        self.file.read_exact(buf)?;
         Ok(())
     }
-}
 
-impl LogRecordsSource for FileSource {
-    fn read_batch_header(&self, pos: usize) -> Result<(i64, usize)> {
+    fn read_batch_header(&mut self, pos: usize) -> Result<(i64, usize)> {
         let actual_pos = self.base_offset + pos;
         if actual_pos + LOG_OVERHEAD > self.file_size {
             return Err(Error::UnexpectedError {
@@ -593,7 +633,7 @@ impl LogRecordsSource for FileSource {
         Ok((base_offset, batch_size))
     }
 
-    fn read_batch_data(&self, pos: usize, size: usize) -> Result<Bytes> {
+    fn read_batch_data(&mut self, pos: usize, size: usize) -> Result<Bytes> {
         let actual_pos = self.base_offset + pos;
         if actual_pos + size > self.file_size {
             return Err(Error::UnexpectedError {
@@ -617,8 +657,37 @@ impl LogRecordsSource for FileSource {
     }
 }
 
+/// Enum for different log record sources.
+enum LogRecordsSource {
+    Memory(MemorySource),
+    File(FileSource),
+}
+
+impl LogRecordsSource {
+    fn read_batch_header(&mut self, pos: usize) -> Result<(i64, usize)> {
+        match self {
+            Self::Memory(s) => s.read_batch_header(pos),
+            Self::File(s) => s.read_batch_header(pos),
+        }
+    }
+
+    fn read_batch_data(&mut self, pos: usize, size: usize) -> Result<Bytes> {
+        match self {
+            Self::Memory(s) => s.read_batch_data(pos, size),
+            Self::File(s) => s.read_batch_data(pos, size),
+        }
+    }
+
+    fn total_size(&self) -> usize {
+        match self {
+            Self::Memory(s) => s.total_size(),
+            Self::File(s) => s.total_size(),
+        }
+    }
+}
+
 pub struct LogRecordsBatches {
-    source: Box<dyn LogRecordsSource>,
+    source: LogRecordsSource,
     current_pos: usize,
     remaining_bytes: usize,
 }
@@ -626,45 +695,7 @@ pub struct LogRecordsBatches {
 impl LogRecordsBatches {
     /// Create from in-memory Vec (existing path - backward compatible).
     pub fn new(data: Vec<u8>) -> Self {
-        let remaining_bytes = data.len();
-        Self {
-            source: Box::new(MemorySource::new(data)),
-            current_pos: 0,
-            remaining_bytes,
-        }
-    }
-
-    /// Create from file.
-    /// Enables streaming without loading entire file into memory.
-    pub fn from_file(file: std::fs::File, base_offset: usize) -> Result<Self> {
-        let source = FileSource::new(file, base_offset)?;
-        let remaining_bytes = source.total_size();
-        Ok(Self {
-            source: Box::new(source),
-            current_pos: 0,
-            remaining_bytes,
-        })
-    }
-
-    /// Create from file with automatic cleanup.
-    /// The file will be deleted when the LogRecordsBatches is dropped.
-    /// This ensures file is closed before deletion.
-    pub fn from_file_with_cleanup(
-        file: std::fs::File,
-        base_offset: usize,
-        file_path: std::path::PathBuf,
-    ) -> Result<Self> {
-        let source = FileSource::new_with_cleanup(file, base_offset, file_path)?;
-        let remaining_bytes = source.total_size();
-        Ok(Self {
-            source: Box::new(source),
-            current_pos: 0,
-            remaining_bytes,
-        })
-    }
-
-    /// Create from any source (for testing).
-    pub fn from_source(source: Box<dyn LogRecordsSource>) -> Self {
+        let source = LogRecordsSource::Memory(MemorySource::new(data));
         let remaining_bytes = source.total_size();
         Self {
             source,
@@ -673,58 +704,60 @@ impl LogRecordsBatches {
         }
     }
 
-    pub fn next_batch_size(&self) -> Option<usize> {
+    /// Create from file.
+    /// Enables streaming without loading entire file into memory.
+    ///
+    /// The file at `file_path` will be deleted when dropped.
+    /// This ensures the file is closed before deletion.
+    pub fn from_file(file: File, base_offset: usize, file_path: PathBuf) -> Result<Self> {
+        let source = FileSource::new(file, base_offset, file_path)?;
+        let remaining_bytes = source.total_size();
+        Ok(Self {
+            source: LogRecordsSource::File(source),
+            current_pos: 0,
+            remaining_bytes,
+        })
+    }
+
+    /// Try to get the size of the next batch.
+    fn next_batch_size(&mut self) -> Result<Option<usize>> {
         if self.remaining_bytes < LOG_OVERHEAD {
-            return None;
+            return Ok(None);
         }
 
-        // Read only header to get size (efficient!)
+        // Read only header to get size
         match self.source.read_batch_header(self.current_pos) {
             Ok((_base_offset, batch_size)) => {
                 if batch_size > self.remaining_bytes {
-                    None
+                    Ok(None)
                 } else {
-                    Some(batch_size)
+                    Ok(Some(batch_size))
                 }
             }
-            Err(e) => {
-                log::debug!(
-                    "Failed to read batch header at pos {}: {}",
-                    self.current_pos,
-                    e
-                );
-                None
-            }
+            Err(e) => Err(e),
         }
     }
 }
 
 impl Iterator for LogRecordsBatches {
-    type Item = LogRecordBatch;
+    type Item = Result<LogRecordBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self.next_batch_size() {
-            Some(batch_size) => {
+            Ok(Some(batch_size)) => {
                 // Read full batch data on-demand
                 match self.source.read_batch_data(self.current_pos, batch_size) {
                     Ok(data) => {
                         let record_batch = LogRecordBatch::new(data);
                         self.current_pos += batch_size;
                         self.remaining_bytes -= batch_size;
-                        Some(record_batch)
+                        Some(Ok(record_batch))
                     }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to read batch data at pos {} size {}: {}",
-                            self.current_pos,
-                            batch_size,
-                            e
-                        );
-                        None
-                    }
+                    Err(e) => Some(Err(e)),
                 }
             }
-            None => None,
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
     }
 }
@@ -946,24 +979,24 @@ fn parse_ipc_message(
     Ok((batch_metadata, body_buffer, message.version()))
 }
 
-pub fn to_arrow_schema(fluss_schema: &RowType) -> SchemaRef {
-    let fields: Vec<Field> = fluss_schema
+pub fn to_arrow_schema(fluss_schema: &RowType) -> Result<SchemaRef> {
+    let fields: Result<Vec<Field>> = fluss_schema
         .fields()
         .iter()
         .map(|f| {
-            Field::new(
+            Ok(Field::new(
                 f.name(),
-                to_arrow_type(f.data_type()),
+                to_arrow_type(f.data_type())?,
                 f.data_type().is_nullable(),
-            )
+            ))
         })
         .collect();
 
-    SchemaRef::new(arrow_schema::Schema::new(fields))
+    Ok(SchemaRef::new(arrow_schema::Schema::new(fields?)))
 }
 
-pub fn to_arrow_type(fluss_type: &DataType) -> ArrowDataType {
-    match fluss_type {
+pub fn to_arrow_type(fluss_type: &DataType) -> Result<ArrowDataType> {
+    Ok(match fluss_type {
         DataType::Boolean(_) => ArrowDataType::Boolean,
         DataType::TinyInt(_) => ArrowDataType::Int8,
         DataType::SmallInt(_) => ArrowDataType::Int16,
@@ -973,58 +1006,87 @@ pub fn to_arrow_type(fluss_type: &DataType) -> ArrowDataType {
         DataType::Double(_) => ArrowDataType::Float64,
         DataType::Char(_) => ArrowDataType::Utf8,
         DataType::String(_) => ArrowDataType::Utf8,
-        DataType::Decimal(decimal_type) => ArrowDataType::Decimal128(
-            decimal_type
-                .precision()
-                .try_into()
-                .expect("precision exceeds u8::MAX"),
-            decimal_type
+        DataType::Decimal(decimal_type) => {
+            let precision =
+                decimal_type
+                    .precision()
+                    .try_into()
+                    .map_err(|_| Error::IllegalArgument {
+                        message: format!(
+                            "Decimal precision {} exceeds Arrow's maximum (u8::MAX)",
+                            decimal_type.precision()
+                        ),
+                    })?;
+            let scale = decimal_type
                 .scale()
                 .try_into()
-                .expect("scale exceeds i8::MAX"),
-        ),
+                .map_err(|_| Error::IllegalArgument {
+                    message: format!(
+                        "Decimal scale {} exceeds Arrow's maximum (i8::MAX)",
+                        decimal_type.scale()
+                    ),
+                })?;
+            ArrowDataType::Decimal128(precision, scale)
+        }
         DataType::Date(_) => ArrowDataType::Date32,
         DataType::Time(time_type) => match time_type.precision() {
             0 => ArrowDataType::Time32(arrow_schema::TimeUnit::Second),
             1..=3 => ArrowDataType::Time32(arrow_schema::TimeUnit::Millisecond),
             4..=6 => ArrowDataType::Time64(arrow_schema::TimeUnit::Microsecond),
             7..=9 => ArrowDataType::Time64(arrow_schema::TimeUnit::Nanosecond),
-            // This arm should never be reached due to validation in TimeType.
-            invalid => panic!("Invalid precision value for TimeType: {invalid}"),
+            invalid => {
+                return Err(Error::IllegalArgument {
+                    message: format!("Invalid precision {invalid} for TimeType (must be 0-9)"),
+                });
+            }
         },
         DataType::Timestamp(timestamp_type) => match timestamp_type.precision() {
             0 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, None),
             1..=3 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
             4..=6 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
             7..=9 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
-            // This arm should never be reached due to validation in Timestamp.
-            invalid => panic!("Invalid precision value for TimestampType: {invalid}"),
+            invalid => {
+                return Err(Error::IllegalArgument {
+                    message: format!("Invalid precision {invalid} for TimestampType (must be 0-9)"),
+                });
+            }
         },
         DataType::TimestampLTz(timestamp_ltz_type) => match timestamp_ltz_type.precision() {
             0 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, None),
             1..=3 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
             4..=6 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
             7..=9 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
-            // This arm should never be reached due to validation in TimestampLTz.
-            invalid => panic!("Invalid precision value for TimestampLTzType: {invalid}"),
+            invalid => {
+                return Err(Error::IllegalArgument {
+                    message: format!(
+                        "Invalid precision {invalid} for TimestampLTzType (must be 0-9)"
+                    ),
+                });
+            }
         },
         DataType::Bytes(_) => ArrowDataType::Binary,
-        DataType::Binary(binary_type) => ArrowDataType::FixedSizeBinary(
-            binary_type
+        DataType::Binary(binary_type) => {
+            let length = binary_type
                 .length()
                 .try_into()
-                .expect("length exceeds i32::MAX"),
-        ),
+                .map_err(|_| Error::IllegalArgument {
+                    message: format!(
+                        "Binary length {} exceeds Arrow's maximum (i32::MAX)",
+                        binary_type.length()
+                    ),
+                })?;
+            ArrowDataType::FixedSizeBinary(length)
+        }
         DataType::Array(array_type) => ArrowDataType::List(
             Field::new_list_field(
-                to_arrow_type(array_type.get_element_type()),
+                to_arrow_type(array_type.get_element_type())?,
                 fluss_type.is_nullable(),
             )
             .into(),
         ),
         DataType::Map(map_type) => {
-            let key_type = to_arrow_type(map_type.key_type());
-            let value_type = to_arrow_type(map_type.value_type());
+            let key_type = to_arrow_type(map_type.key_type())?;
+            let value_type = to_arrow_type(map_type.value_type())?;
             let entry_fields = vec![
                 Field::new("key", key_type, map_type.key_type().is_nullable()),
                 Field::new("value", value_type, map_type.value_type().is_nullable()),
@@ -1038,20 +1100,21 @@ pub fn to_arrow_type(fluss_type: &DataType) -> ArrowDataType {
                 false,
             )
         }
-        DataType::Row(row_type) => ArrowDataType::Struct(arrow_schema::Fields::from(
-            row_type
+        DataType::Row(row_type) => {
+            let fields: Result<Vec<Field>> = row_type
                 .fields()
                 .iter()
                 .map(|f| {
-                    Field::new(
+                    Ok(Field::new(
                         f.name(),
-                        to_arrow_type(f.data_type()),
+                        to_arrow_type(f.data_type())?,
                         f.data_type().is_nullable(),
-                    )
+                    ))
                 })
-                .collect::<Vec<Field>>(),
-        )),
-    }
+                .collect();
+            ArrowDataType::Struct(arrow_schema::Fields::from(fields?))
+        }
+    })
 }
 
 #[derive(Clone)]
@@ -1215,7 +1278,7 @@ impl ReadContext {
             &body_buffer,
             batch_metadata,
             resolve_schema,
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
             None,
             &version,
         )?;
@@ -1255,7 +1318,7 @@ impl ReadContext {
             &body_buffer,
             batch_metadata,
             self.full_schema.clone(),
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
             None,
             &version,
         )?;
@@ -1364,81 +1427,114 @@ mod tests {
 
     #[test]
     fn test_to_array_type() {
-        assert_eq!(to_arrow_type(&DataTypes::boolean()), ArrowDataType::Boolean);
-        assert_eq!(to_arrow_type(&DataTypes::tinyint()), ArrowDataType::Int8);
-        assert_eq!(to_arrow_type(&DataTypes::smallint()), ArrowDataType::Int16);
-        assert_eq!(to_arrow_type(&DataTypes::bigint()), ArrowDataType::Int64);
-        assert_eq!(to_arrow_type(&DataTypes::int()), ArrowDataType::Int32);
-        assert_eq!(to_arrow_type(&DataTypes::float()), ArrowDataType::Float32);
-        assert_eq!(to_arrow_type(&DataTypes::double()), ArrowDataType::Float64);
-        assert_eq!(to_arrow_type(&DataTypes::char(16)), ArrowDataType::Utf8);
-        assert_eq!(to_arrow_type(&DataTypes::string()), ArrowDataType::Utf8);
         assert_eq!(
-            to_arrow_type(&DataTypes::decimal(10, 2)),
+            to_arrow_type(&DataTypes::boolean()).unwrap(),
+            ArrowDataType::Boolean
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::tinyint()).unwrap(),
+            ArrowDataType::Int8
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::smallint()).unwrap(),
+            ArrowDataType::Int16
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::bigint()).unwrap(),
+            ArrowDataType::Int64
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::int()).unwrap(),
+            ArrowDataType::Int32
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::float()).unwrap(),
+            ArrowDataType::Float32
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::double()).unwrap(),
+            ArrowDataType::Float64
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::char(16)).unwrap(),
+            ArrowDataType::Utf8
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::string()).unwrap(),
+            ArrowDataType::Utf8
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::decimal(10, 2)).unwrap(),
             ArrowDataType::Decimal128(10, 2)
         );
-        assert_eq!(to_arrow_type(&DataTypes::date()), ArrowDataType::Date32);
         assert_eq!(
-            to_arrow_type(&DataTypes::time()),
+            to_arrow_type(&DataTypes::date()).unwrap(),
+            ArrowDataType::Date32
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::time()).unwrap(),
             ArrowDataType::Time32(arrow_schema::TimeUnit::Second)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::time_with_precision(3)),
+            to_arrow_type(&DataTypes::time_with_precision(3)).unwrap(),
             ArrowDataType::Time32(arrow_schema::TimeUnit::Millisecond)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::time_with_precision(6)),
+            to_arrow_type(&DataTypes::time_with_precision(6)).unwrap(),
             ArrowDataType::Time64(arrow_schema::TimeUnit::Microsecond)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::time_with_precision(9)),
+            to_arrow_type(&DataTypes::time_with_precision(9)).unwrap(),
             ArrowDataType::Time64(arrow_schema::TimeUnit::Nanosecond)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_with_precision(0)),
+            to_arrow_type(&DataTypes::timestamp_with_precision(0)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, None)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_with_precision(3)),
+            to_arrow_type(&DataTypes::timestamp_with_precision(3)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_with_precision(6)),
+            to_arrow_type(&DataTypes::timestamp_with_precision(6)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_with_precision(9)),
+            to_arrow_type(&DataTypes::timestamp_with_precision(9)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(0)),
+            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(0)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, None)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(3)),
+            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(3)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(6)),
+            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(6)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
         );
         assert_eq!(
-            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(9)),
+            to_arrow_type(&DataTypes::timestamp_ltz_with_precision(9)).unwrap(),
             ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None)
         );
-        assert_eq!(to_arrow_type(&DataTypes::bytes()), ArrowDataType::Binary);
         assert_eq!(
-            to_arrow_type(&DataTypes::binary(16)),
+            to_arrow_type(&DataTypes::bytes()).unwrap(),
+            ArrowDataType::Binary
+        );
+        assert_eq!(
+            to_arrow_type(&DataTypes::binary(16)).unwrap(),
             ArrowDataType::FixedSizeBinary(16)
         );
 
         assert_eq!(
-            to_arrow_type(&DataTypes::array(DataTypes::int())),
+            to_arrow_type(&DataTypes::array(DataTypes::int())).unwrap(),
             ArrowDataType::List(Field::new_list_field(ArrowDataType::Int32, true).into())
         );
 
         assert_eq!(
-            to_arrow_type(&DataTypes::map(DataTypes::string(), DataTypes::int())),
+            to_arrow_type(&DataTypes::map(DataTypes::string(), DataTypes::int())).unwrap(),
             ArrowDataType::Map(
                 Arc::new(Field::new(
                     "entries",
@@ -1456,7 +1552,8 @@ mod tests {
             to_arrow_type(&DataTypes::row(vec![
                 DataTypes::field("f1".to_string(), DataTypes::int()),
                 DataTypes::field("f2".to_string(), DataTypes::string()),
-            ])),
+            ]))
+            .unwrap(),
             ArrowDataType::Struct(arrow_schema::Fields::from(vec![
                 Field::new("f1", ArrowDataType::Int32, true),
                 Field::new("f2", ArrowDataType::Utf8, true),
@@ -1520,7 +1617,7 @@ mod tests {
             DataField::new("id".to_string(), DataTypes::int(), None),
             DataField::new("name".to_string(), DataTypes::string(), None),
         ]);
-        let schema = to_arrow_schema(&row_type);
+        let schema = to_arrow_schema(&row_type).unwrap();
         let result = ReadContext::with_projection_pushdown(schema, vec![0, 2], false);
 
         assert!(matches!(result, Err(IllegalArgument { .. })));
@@ -1555,11 +1652,80 @@ mod tests {
         out
     }
 
+    #[test]
+    fn test_temporal_and_decimal_builder_validation() {
+        use arrow::array::Array;
+
+        // Test valid builder creation with precision=10, scale=2
+        let mut builder =
+            RowAppendRecordBatchBuilder::create_builder(&ArrowDataType::Decimal128(10, 2)).unwrap();
+        let decimal_builder = builder
+            .as_any_mut()
+            .downcast_mut::<Decimal128Builder>()
+            .expect("Expected Decimal128Builder");
+        // Verify precision and scale
+        let array = decimal_builder.finish();
+        assert_eq!(array.data_type(), &ArrowDataType::Decimal128(10, 2));
+
+        // Test error case: invalid precision/scale
+        let result =
+            RowAppendRecordBatchBuilder::create_builder(&ArrowDataType::Decimal128(100, 50));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decimal_rescaling_and_validation() -> Result<()> {
+        use crate::row::{Datum, Decimal, GenericRow};
+        use arrow::array::Decimal128Array;
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        // Test 1: Rescaling from scale 3 to scale 2
+        let row_type = RowType::new(vec![DataField::new(
+            "amount".to_string(),
+            DataTypes::decimal(10, 2),
+            None,
+        )]);
+        let mut builder = RowAppendRecordBatchBuilder::new(&row_type)?;
+        let decimal = Decimal::from_big_decimal(BigDecimal::from_str("123.456").unwrap(), 10, 3)?;
+        builder.append(&GenericRow {
+            values: vec![Datum::Decimal(decimal)],
+        })?;
+        let batch = builder.build_arrow_record_batch()?;
+        let array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(array.value(0), 12346); // 123.456 rounded to 2 decimal places
+        assert_eq!(array.scale(), 2);
+
+        // Test 2: Precision overflow (should error)
+        let row_type = RowType::new(vec![DataField::new(
+            "amount".to_string(),
+            DataTypes::decimal(5, 2),
+            None,
+        )]);
+        let mut builder = RowAppendRecordBatchBuilder::new(&row_type)?;
+        let decimal = Decimal::from_big_decimal(BigDecimal::from_str("123456.78").unwrap(), 10, 2)?;
+        let result = builder.append(&GenericRow {
+            values: vec![Datum::Decimal(decimal)],
+        });
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("precision overflow")
+        );
+
+        Ok(())
+    }
+
     // Tests for file-backed streaming
 
     #[test]
     fn test_file_source_streaming() -> Result<()> {
-        use std::io::Write;
         use tempfile::NamedTempFile;
 
         // Test 1: Basic file reads work
@@ -1568,8 +1734,9 @@ mod tests {
         tmp_file.write_all(&test_data)?;
         tmp_file.flush()?;
 
-        let file = std::fs::File::open(tmp_file.path())?;
-        let source = FileSource::new(file, 0)?;
+        let file_path = tmp_file.path().to_path_buf();
+        let file = File::open(&file_path)?;
+        let mut source = FileSource::new(file, 0, file_path)?;
 
         // Read full data
         let data = source.read_batch_data(0, 10)?;
@@ -1587,12 +1754,148 @@ mod tests {
         tmp_file2.write_all(&actual_data)?;
         tmp_file2.flush()?;
 
-        let file2 = std::fs::File::open(tmp_file2.path())?;
-        let source2 = FileSource::new(file2, 100)?; // Skip first 100 bytes
+        let file_path2 = tmp_file2.path().to_path_buf();
+        let file2 = File::open(&file_path2)?;
+        let mut source2 = FileSource::new(file2, 100, file_path2)?; // Skip first 100 bytes
 
         assert_eq!(source2.total_size(), 5); // Only counts data after offset
         let data2 = source2.read_batch_data(0, 5)?;
         assert_eq!(data2.to_vec(), actual_data);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_types_end_to_end() -> Result<()> {
+        use crate::row::{Date, Datum, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
+        use arrow::array::{
+            Date32Array, Decimal128Array, Int32Array, Time32MillisecondArray,
+            Time64NanosecondArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+        };
+        use bigdecimal::BigDecimal;
+        use std::str::FromStr;
+
+        // Schema with int, decimal, date, time (ms + ns), timestamps (μs + ns)
+        let row_type = RowType::new(vec![
+            DataField::new("id".to_string(), DataTypes::int(), None),
+            DataField::new("amount".to_string(), DataTypes::decimal(10, 2), None),
+            DataField::new("date".to_string(), DataTypes::date(), None),
+            DataField::new(
+                "time_ms".to_string(),
+                DataTypes::time_with_precision(3),
+                None,
+            ),
+            DataField::new(
+                "time_ns".to_string(),
+                DataTypes::time_with_precision(9),
+                None,
+            ),
+            DataField::new(
+                "ts_us".to_string(),
+                DataTypes::timestamp_with_precision(6),
+                None,
+            ),
+            DataField::new(
+                "ts_ltz_ns".to_string(),
+                DataTypes::timestamp_ltz_with_precision(9),
+                None,
+            ),
+        ]);
+
+        let mut builder = RowAppendRecordBatchBuilder::new(&row_type)?;
+
+        // Append rows with various data types
+        builder.append(&GenericRow {
+            values: vec![
+                Datum::Int32(1),
+                Datum::Decimal(Decimal::from_big_decimal(
+                    BigDecimal::from_str("123.456").unwrap(),
+                    10,
+                    3,
+                )?),
+                // 18000 days since epoch = 2019-04-14
+                Datum::Date(Date::new(18000)),
+                // 43200000 ms = 12:00:00.000 (noon)
+                Datum::Time(Time::new(43200000)),
+                // 12345 ms = 00:00:12.345
+                Datum::Time(Time::new(12345)),
+                // 1609459200000 ms = 2021-01-01 00:00:00 UTC, with 123456 additional nanoseconds
+                Datum::TimestampNtz(TimestampNtz::from_millis_nanos(1609459200000, 123456)?),
+                // 1609459200000 ms = 2021-01-01 00:00:00 UTC, with 987654 additional nanoseconds
+                Datum::TimestampLtz(TimestampLtz::from_millis_nanos(1609459200000, 987654)?),
+            ],
+        })?;
+
+        let batch = builder.build_arrow_record_batch()?;
+
+        // Verify all conversions
+        assert_eq!(
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+
+        let dec = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .unwrap();
+        assert_eq!(dec.value(0), 12346); // 123.456 rounded to 2 decimal places
+
+        assert_eq!(
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .unwrap()
+                .value(0),
+            18000
+        );
+
+        assert_eq!(
+            batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Time32MillisecondArray>()
+                .unwrap()
+                .value(0),
+            43200000
+        );
+
+        assert_eq!(
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Time64NanosecondArray>()
+                .unwrap()
+                .value(0),
+            12345000000
+        );
+
+        // Timestamp with sub-millisecond nanos preserved
+        assert_eq!(
+            batch
+                .column(5)
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(0),
+            1609459200000123
+        );
+
+        assert_eq!(
+            batch
+                .column(6)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(0),
+            1609459200000987654
+        );
 
         Ok(())
     }
@@ -1605,7 +1908,6 @@ mod tests {
         };
         use crate::metadata::TablePath;
         use crate::row::GenericRow;
-        use std::io::Write;
         use tempfile::NamedTempFile;
 
         // Integration test: Real log record batch streamed from file
@@ -1623,15 +1925,15 @@ mod tests {
                 compression_type: ArrowCompressionType::None,
                 compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
             },
-        );
+        )?;
 
-        let mut row = GenericRow::new();
+        let mut row = GenericRow::new(2);
         row.set_field(0, 1_i32);
         row.set_field(1, "alice");
         let record = WriteRecord::for_append(table_path.clone(), 1, row);
         builder.append(&record)?;
 
-        let mut row2 = GenericRow::new();
+        let mut row2 = GenericRow::new(2);
         row2.set_field(0, 2_i32);
         row2.set_field(1, "bob");
         let record2 = WriteRecord::for_append(table_path, 2, row2);
@@ -1645,11 +1947,12 @@ mod tests {
         tmp_file.flush()?;
 
         // Create file-backed LogRecordsBatches (should stream, not load all into memory)
-        let file = std::fs::File::open(tmp_file.path())?;
-        let mut batches = LogRecordsBatches::from_file(file, 0)?;
+        let file_path = tmp_file.path().to_path_buf();
+        let file = File::open(&file_path)?;
+        let mut batches = LogRecordsBatches::from_file(file, 0, file_path)?;
 
         // Iterate through batches (should work just like in-memory)
-        let batch = batches.next().expect("Should have at least one batch");
+        let batch = batches.next().expect("Should have at least one batch")?;
         assert!(batch.size_in_bytes() > 0);
         assert_eq!(batch.record_count(), 2);
 

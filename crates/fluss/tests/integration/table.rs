@@ -33,8 +33,8 @@ static SHARED_FLUSS_CLUSTER: LazyLock<Arc<RwLock<Option<FlussTestingCluster>>>> 
 #[after_all]
 mod table_test {
     use super::SHARED_FLUSS_CLUSTER;
-    use crate::integration::fluss_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
-    use crate::integration::utils::create_table;
+    use crate::integration::fluss_cluster::FlussTestingCluster;
+    use crate::integration::utils::{create_table, get_cluster, start_cluster, stop_cluster};
     use arrow::array::record_batch;
     use fluss::client::{FlussTable, TableScan};
     use fluss::metadata::{DataTypes, Schema, TableBucket, TableDescriptor, TablePath};
@@ -44,50 +44,18 @@ mod table_test {
     use jiff::Timestamp;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use std::thread;
     use std::time::Duration;
 
     fn before_all() {
-        // Create a new tokio runtime in a separate thread
-        let cluster_guard = SHARED_FLUSS_CLUSTER.clone();
-        thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(async {
-                let cluster = FlussTestingClusterBuilder::new("test_table").build().await;
-                let mut guard = cluster_guard.write();
-                *guard = Some(cluster);
-            });
-        })
-        .join()
-        .expect("Failed to create cluster");
-
-        // wait for 20 seconds to avoid the error like
-        // CoordinatorEventProcessor is not initialized yet
-        thread::sleep(std::time::Duration::from_secs(20));
+        start_cluster("test_table", SHARED_FLUSS_CLUSTER.clone());
     }
 
     fn get_fluss_cluster() -> Arc<FlussTestingCluster> {
-        let cluster_guard = SHARED_FLUSS_CLUSTER.read();
-        if cluster_guard.is_none() {
-            panic!("Fluss cluster not initialized. Make sure before_all() was called.");
-        }
-        Arc::new(cluster_guard.as_ref().unwrap().clone())
+        get_cluster(&SHARED_FLUSS_CLUSTER)
     }
 
     fn after_all() {
-        // Create a new tokio runtime in a separate thread
-        let cluster_guard = SHARED_FLUSS_CLUSTER.clone();
-        thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-            rt.block_on(async {
-                let mut guard = cluster_guard.write();
-                if let Some(cluster) = guard.take() {
-                    cluster.stop().await;
-                }
-            });
-        })
-        .join()
-        .expect("Failed to cleanup cluster");
+        stop_cluster(SHARED_FLUSS_CLUSTER.clone());
     }
 
     #[tokio::test]
@@ -527,11 +495,13 @@ mod table_test {
 
         use arrow::array::Int32Array;
         let batches = scanner.poll(Duration::from_secs(10)).await.unwrap();
-        let mut all_ids: Vec<i32> = batches
+        let all_ids: Vec<i32> = batches
             .iter()
             .flat_map(|b| {
-                (0..b.num_rows()).map(|i| {
-                    b.column(0)
+                let batch = b.batch();
+                (0..batch.num_rows()).map(move |i| {
+                    batch
+                        .column(0)
                         .as_any()
                         .downcast_ref::<Int32Array>()
                         .unwrap()
@@ -555,8 +525,10 @@ mod table_test {
         let new_ids: Vec<i32> = more
             .iter()
             .flat_map(|b| {
-                (0..b.num_rows()).map(|i| {
-                    b.column(0)
+                let batch = b.batch();
+                (0..batch.num_rows()).map(move |i| {
+                    batch
+                        .column(0)
                         .as_any()
                         .downcast_ref::<Int32Array>()
                         .unwrap()
@@ -576,8 +548,10 @@ mod table_test {
         let trunc_ids: Vec<i32> = trunc_batches
             .iter()
             .flat_map(|b| {
-                (0..b.num_rows()).map(|i| {
-                    b.column(0)
+                let batch = b.batch();
+                (0..batch.num_rows()).map(move |i| {
+                    batch
+                        .column(0)
                         .as_any()
                         .downcast_ref::<Int32Array>()
                         .unwrap()
@@ -600,6 +574,397 @@ mod table_test {
         let proj_batches = proj.poll(Duration::from_secs(10)).await.unwrap();
 
         // Projected batch should have 1 column (id), not 2 (id, name)
-        assert_eq!(proj_batches[0].num_columns(), 1);
+        assert_eq!(proj_batches[0].batch().num_columns(), 1);
+    }
+
+    /// Integration test covering produce and scan operations for all supported datatypes
+    /// in log tables.
+    #[tokio::test]
+    async fn all_supported_datatypes() {
+        use fluss::row::{Date, Datum, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
+
+        let cluster = get_fluss_cluster();
+        let connection = cluster.get_fluss_connection().await;
+
+        let admin = connection.get_admin().await.expect("Failed to get admin");
+
+        let table_path = TablePath::new("fluss".to_string(), "test_log_all_datatypes".to_string());
+
+        // Create a log table with all supported datatypes for append/scan
+        let table_descriptor = TableDescriptor::builder()
+            .schema(
+                Schema::builder()
+                    // Integer types
+                    .column("col_tinyint", DataTypes::tinyint())
+                    .column("col_smallint", DataTypes::smallint())
+                    .column("col_int", DataTypes::int())
+                    .column("col_bigint", DataTypes::bigint())
+                    // Floating point types
+                    .column("col_float", DataTypes::float())
+                    .column("col_double", DataTypes::double())
+                    // Boolean type
+                    .column("col_boolean", DataTypes::boolean())
+                    // Char type
+                    .column("col_char", DataTypes::char(10))
+                    // String type
+                    .column("col_string", DataTypes::string())
+                    // Decimal type
+                    .column("col_decimal", DataTypes::decimal(10, 2))
+                    // Date type
+                    .column("col_date", DataTypes::date())
+                    // Time types
+                    .column("col_time_s", DataTypes::time_with_precision(0))
+                    .column("col_time_ms", DataTypes::time_with_precision(3))
+                    .column("col_time_us", DataTypes::time_with_precision(6))
+                    .column("col_time_ns", DataTypes::time_with_precision(9))
+                    // Timestamp types
+                    .column("col_timestamp_s", DataTypes::timestamp_with_precision(0))
+                    .column("col_timestamp_ms", DataTypes::timestamp_with_precision(3))
+                    .column("col_timestamp_us", DataTypes::timestamp_with_precision(6))
+                    .column("col_timestamp_ns", DataTypes::timestamp_with_precision(9))
+                    // Timestamp_ltz types
+                    .column(
+                        "col_timestamp_ltz_s",
+                        DataTypes::timestamp_ltz_with_precision(0),
+                    )
+                    .column(
+                        "col_timestamp_ltz_ms",
+                        DataTypes::timestamp_ltz_with_precision(3),
+                    )
+                    .column(
+                        "col_timestamp_ltz_us",
+                        DataTypes::timestamp_ltz_with_precision(6),
+                    )
+                    .column(
+                        "col_timestamp_ltz_ns",
+                        DataTypes::timestamp_ltz_with_precision(9),
+                    )
+                    // Bytes type
+                    .column("col_bytes", DataTypes::bytes())
+                    // Timestamp types with negative values (before Unix epoch)
+                    .column(
+                        "col_timestamp_us_neg",
+                        DataTypes::timestamp_with_precision(6),
+                    )
+                    .column(
+                        "col_timestamp_ns_neg",
+                        DataTypes::timestamp_with_precision(9),
+                    )
+                    .column(
+                        "col_timestamp_ltz_us_neg",
+                        DataTypes::timestamp_ltz_with_precision(6),
+                    )
+                    .column(
+                        "col_timestamp_ltz_ns_neg",
+                        DataTypes::timestamp_ltz_with_precision(9),
+                    )
+                    .build()
+                    .expect("Failed to build schema"),
+            )
+            .build()
+            .expect("Failed to build table");
+
+        create_table(&admin, &table_path, &table_descriptor).await;
+
+        let table = connection
+            .get_table(&table_path)
+            .await
+            .expect("Failed to get table");
+
+        let field_count = table.table_info().schema.columns().len();
+
+        let append_writer = table
+            .new_append()
+            .expect("Failed to create append")
+            .create_writer();
+
+        // Test data for all datatypes
+        let col_tinyint = 127i8;
+        let col_smallint = 32767i16;
+        let col_int = 2147483647i32;
+        let col_bigint = 9223372036854775807i64;
+        let col_float = 3.14f32;
+        let col_double = 2.718281828459045f64;
+        let col_boolean = true;
+        let col_char = "hello";
+        let col_string = "world of fluss rust client";
+        let col_decimal = Decimal::from_unscaled_long(12345, 10, 2).unwrap(); // 123.45
+        let col_date = Date::new(20476); // 2026-01-23
+        let col_time_s = Time::new(36827000); // 10:13:47
+        let col_time_ms = Time::new(36827123); // 10:13:47.123
+        let col_time_us = Time::new(86399999); // 23:59:59.999
+        let col_time_ns = Time::new(1); // 00:00:00.001
+        // 2026-01-23 10:13:47 UTC
+        let col_timestamp_s = TimestampNtz::new(1769163227000);
+        // 2026-01-23 10:13:47.123 UTC
+        let col_timestamp_ms = TimestampNtz::new(1769163227123);
+        // 2026-01-23 10:13:47.123456 UTC
+        let col_timestamp_us = TimestampNtz::from_millis_nanos(1769163227123, 456000).unwrap();
+        // 2026-01-23 10:13:47.123999999 UTC
+        let col_timestamp_ns = TimestampNtz::from_millis_nanos(1769163227123, 999_999).unwrap();
+        let col_timestamp_ltz_s = TimestampLtz::new(1769163227000);
+        let col_timestamp_ltz_ms = TimestampLtz::new(1769163227123);
+        let col_timestamp_ltz_us = TimestampLtz::from_millis_nanos(1769163227123, 456000).unwrap();
+        let col_timestamp_ltz_ns = TimestampLtz::from_millis_nanos(1769163227123, 999_999).unwrap();
+        let col_bytes: Vec<u8> = b"binary data".to_vec();
+
+        // 1960-06-15 08:30:45.123456 UTC (before 1970)
+        let col_timestamp_us_neg = TimestampNtz::from_millis_nanos(-301234154877, 456000).unwrap();
+        // 1960-06-15 08:30:45.123999999 UTC (before 1970)
+        let col_timestamp_ns_neg = TimestampNtz::from_millis_nanos(-301234154877, 999_999).unwrap();
+        let col_timestamp_ltz_us_neg =
+            TimestampLtz::from_millis_nanos(-301234154877, 456000).unwrap();
+        let col_timestamp_ltz_ns_neg =
+            TimestampLtz::from_millis_nanos(-301234154877, 999_999).unwrap();
+
+        // Append a row with all datatypes
+        let mut row = GenericRow::new(field_count);
+        row.set_field(0, col_tinyint);
+        row.set_field(1, col_smallint);
+        row.set_field(2, col_int);
+        row.set_field(3, col_bigint);
+        row.set_field(4, col_float);
+        row.set_field(5, col_double);
+        row.set_field(6, col_boolean);
+        row.set_field(7, col_char);
+        row.set_field(8, col_string);
+        row.set_field(9, col_decimal.clone());
+        row.set_field(10, col_date);
+        row.set_field(11, col_time_s);
+        row.set_field(12, col_time_ms);
+        row.set_field(13, col_time_us);
+        row.set_field(14, col_time_ns);
+        row.set_field(15, col_timestamp_s);
+        row.set_field(16, col_timestamp_ms);
+        row.set_field(17, col_timestamp_us.clone());
+        row.set_field(18, col_timestamp_ns.clone());
+        row.set_field(19, col_timestamp_ltz_s);
+        row.set_field(20, col_timestamp_ltz_ms);
+        row.set_field(21, col_timestamp_ltz_us.clone());
+        row.set_field(22, col_timestamp_ltz_ns.clone());
+        row.set_field(23, col_bytes.as_slice());
+        row.set_field(24, col_timestamp_us_neg.clone());
+        row.set_field(25, col_timestamp_ns_neg.clone());
+        row.set_field(26, col_timestamp_ltz_us_neg.clone());
+        row.set_field(27, col_timestamp_ltz_ns_neg.clone());
+
+        append_writer
+            .append(row)
+            .await
+            .expect("Failed to append row with all datatypes");
+
+        // Append a row with null values for all columns
+        let mut row_with_nulls = GenericRow::new(field_count);
+        for i in 0..field_count {
+            row_with_nulls.set_field(i, Datum::Null);
+        }
+
+        append_writer
+            .append(row_with_nulls)
+            .await
+            .expect("Failed to append row with nulls");
+
+        append_writer.flush().await.expect("Failed to flush");
+
+        // Scan the records
+        let records = scan_table(&table, |scan| scan).await;
+
+        assert_eq!(records.len(), 2, "Expected 2 records");
+
+        let found_row = records[0].row();
+        assert_eq!(found_row.get_byte(0), col_tinyint, "col_tinyint mismatch");
+        assert_eq!(
+            found_row.get_short(1),
+            col_smallint,
+            "col_smallint mismatch"
+        );
+        assert_eq!(found_row.get_int(2), col_int, "col_int mismatch");
+        assert_eq!(found_row.get_long(3), col_bigint, "col_bigint mismatch");
+        assert!(
+            (found_row.get_float(4) - col_float).abs() < f32::EPSILON,
+            "col_float mismatch: expected {}, got {}",
+            col_float,
+            found_row.get_float(4)
+        );
+        assert!(
+            (found_row.get_double(5) - col_double).abs() < f64::EPSILON,
+            "col_double mismatch: expected {}, got {}",
+            col_double,
+            found_row.get_double(5)
+        );
+        assert_eq!(
+            found_row.get_boolean(6),
+            col_boolean,
+            "col_boolean mismatch"
+        );
+        assert_eq!(found_row.get_char(7, 10), col_char, "col_char mismatch");
+        assert_eq!(found_row.get_string(8), col_string, "col_string mismatch");
+        assert_eq!(
+            found_row.get_decimal(9, 10, 2),
+            col_decimal,
+            "col_decimal mismatch"
+        );
+        assert_eq!(
+            found_row.get_date(10).get_inner(),
+            col_date.get_inner(),
+            "col_date mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_time(11).get_inner(),
+            col_time_s.get_inner(),
+            "col_time_s mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_time(12).get_inner(),
+            col_time_ms.get_inner(),
+            "col_time_ms mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_time(13).get_inner(),
+            col_time_us.get_inner(),
+            "col_time_us mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_time(14).get_inner(),
+            col_time_ns.get_inner(),
+            "col_time_ns mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_timestamp_ntz(15, 0).get_millisecond(),
+            col_timestamp_s.get_millisecond(),
+            "col_timestamp_s mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_timestamp_ntz(16, 3).get_millisecond(),
+            col_timestamp_ms.get_millisecond(),
+            "col_timestamp_ms mismatch"
+        );
+
+        let read_ts_us = found_row.get_timestamp_ntz(17, 6);
+        assert_eq!(
+            read_ts_us.get_millisecond(),
+            col_timestamp_us.get_millisecond(),
+            "col_timestamp_us millis mismatch"
+        );
+        assert_eq!(
+            read_ts_us.get_nano_of_millisecond(),
+            col_timestamp_us.get_nano_of_millisecond(),
+            "col_timestamp_us nanos mismatch"
+        );
+
+        let read_ts_ns = found_row.get_timestamp_ntz(18, 9);
+        assert_eq!(
+            read_ts_ns.get_millisecond(),
+            col_timestamp_ns.get_millisecond(),
+            "col_timestamp_ns millis mismatch"
+        );
+        assert_eq!(
+            read_ts_ns.get_nano_of_millisecond(),
+            col_timestamp_ns.get_nano_of_millisecond(),
+            "col_timestamp_ns nanos mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_timestamp_ltz(19, 0).get_epoch_millisecond(),
+            col_timestamp_ltz_s.get_epoch_millisecond(),
+            "col_timestamp_ltz_s mismatch"
+        );
+
+        assert_eq!(
+            found_row.get_timestamp_ltz(20, 3).get_epoch_millisecond(),
+            col_timestamp_ltz_ms.get_epoch_millisecond(),
+            "col_timestamp_ltz_ms mismatch"
+        );
+
+        let read_ts_ltz_us = found_row.get_timestamp_ltz(21, 6);
+        assert_eq!(
+            read_ts_ltz_us.get_epoch_millisecond(),
+            col_timestamp_ltz_us.get_epoch_millisecond(),
+            "col_timestamp_ltz_us millis mismatch"
+        );
+        assert_eq!(
+            read_ts_ltz_us.get_nano_of_millisecond(),
+            col_timestamp_ltz_us.get_nano_of_millisecond(),
+            "col_timestamp_ltz_us nanos mismatch"
+        );
+
+        let read_ts_ltz_ns = found_row.get_timestamp_ltz(22, 9);
+        assert_eq!(
+            read_ts_ltz_ns.get_epoch_millisecond(),
+            col_timestamp_ltz_ns.get_epoch_millisecond(),
+            "col_timestamp_ltz_ns millis mismatch"
+        );
+        assert_eq!(
+            read_ts_ltz_ns.get_nano_of_millisecond(),
+            col_timestamp_ltz_ns.get_nano_of_millisecond(),
+            "col_timestamp_ltz_ns nanos mismatch"
+        );
+        assert_eq!(found_row.get_bytes(23), col_bytes, "col_bytes mismatch");
+
+        // Verify timestamps before Unix epoch (negative timestamps)
+        let read_ts_us_neg = found_row.get_timestamp_ntz(24, 6);
+        assert_eq!(
+            read_ts_us_neg.get_millisecond(),
+            col_timestamp_us_neg.get_millisecond(),
+            "col_timestamp_us_neg millis mismatch"
+        );
+        assert_eq!(
+            read_ts_us_neg.get_nano_of_millisecond(),
+            col_timestamp_us_neg.get_nano_of_millisecond(),
+            "col_timestamp_us_neg nanos mismatch"
+        );
+
+        let read_ts_ns_neg = found_row.get_timestamp_ntz(25, 9);
+        assert_eq!(
+            read_ts_ns_neg.get_millisecond(),
+            col_timestamp_ns_neg.get_millisecond(),
+            "col_timestamp_ns_neg millis mismatch"
+        );
+        assert_eq!(
+            read_ts_ns_neg.get_nano_of_millisecond(),
+            col_timestamp_ns_neg.get_nano_of_millisecond(),
+            "col_timestamp_ns_neg nanos mismatch"
+        );
+
+        let read_ts_ltz_us_neg = found_row.get_timestamp_ltz(26, 6);
+        assert_eq!(
+            read_ts_ltz_us_neg.get_epoch_millisecond(),
+            col_timestamp_ltz_us_neg.get_epoch_millisecond(),
+            "col_timestamp_ltz_us_neg millis mismatch"
+        );
+        assert_eq!(
+            read_ts_ltz_us_neg.get_nano_of_millisecond(),
+            col_timestamp_ltz_us_neg.get_nano_of_millisecond(),
+            "col_timestamp_ltz_us_neg nanos mismatch"
+        );
+
+        let read_ts_ltz_ns_neg = found_row.get_timestamp_ltz(27, 9);
+        assert_eq!(
+            read_ts_ltz_ns_neg.get_epoch_millisecond(),
+            col_timestamp_ltz_ns_neg.get_epoch_millisecond(),
+            "col_timestamp_ltz_ns_neg millis mismatch"
+        );
+        assert_eq!(
+            read_ts_ltz_ns_neg.get_nano_of_millisecond(),
+            col_timestamp_ltz_ns_neg.get_nano_of_millisecond(),
+            "col_timestamp_ltz_ns_neg nanos mismatch"
+        );
+
+        // Verify row with all nulls (record index 1)
+        let found_row_nulls = records[1].row();
+        for i in 0..field_count {
+            assert!(found_row_nulls.is_null_at(i), "column {} should be null", i);
+        }
+
+        admin
+            .drop_table(&table_path, false)
+            .await
+            .expect("Failed to drop table");
     }
 }
