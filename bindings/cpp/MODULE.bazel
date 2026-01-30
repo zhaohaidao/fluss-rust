@@ -21,3 +21,11 @@ module(
 
 bazel_dep(name = "rules_cc", version = "0.0.17")
 bazel_dep(name = "platforms", version = "0.0.10")
+bazel_dep(name = "protobuf", version = "21.7.3.red", repo_name = "com_google_protobuf")
+
+single_version_override(
+    module_name = "protobuf",
+    version = "21.7.3.red",
+    patches = ["//:protobuf_cc_proto_library.patch"],
+    patch_strip = 1,
+)

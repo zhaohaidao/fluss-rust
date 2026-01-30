@@ -50,6 +50,8 @@ genrule(
     cmd = """
         set -e
         EXECROOT=$$(pwd)
+        PROTOC_BIN=$$EXECROOT/$(location @com_google_protobuf//:protoc)
+        export PROTOC=$$PROTOC_BIN
         OUTPUT_LIB=$(location rust_lib_debug.a)
         OUTPUT_CC=$(location rust_bridge_cc_debug.cc)
         OUTPUT_H=$(location rust_bridge_h_debug.h)
@@ -99,6 +101,7 @@ genrule(
     """,
     message = "Building Rust library (debug) with cargo...",
     local = 1,
+    tools = ["@com_google_protobuf//:protoc"],
 )
 
 genrule(
@@ -117,6 +120,8 @@ genrule(
     cmd = """
         set -e
         EXECROOT=$$(pwd)
+        PROTOC_BIN=$$EXECROOT/$(location @com_google_protobuf//:protoc)
+        export PROTOC=$$PROTOC_BIN
         OUTPUT_LIB=$(location rust_lib_release.a)
         OUTPUT_CC=$(location rust_bridge_cc_release.cc)
         OUTPUT_H=$(location rust_bridge_h_release.h)
@@ -166,6 +171,7 @@ genrule(
     """,
     message = "Building Rust library (release) with cargo...",
     local = 1,
+    tools = ["@com_google_protobuf//:protoc"],
 )
 
 filegroup(
@@ -303,6 +309,8 @@ cc_library(
     }),
     deps = [
         ":rust_lib",
+        "//proto:fluss_api_cc_proto",
+        "@com_google_protobuf//:protobuf",
     ],
     visibility = ["//visibility:public"],
 )

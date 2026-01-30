@@ -1,0 +1,16 @@
+diff --git a/bazel/BUILD.bazel b/bazel/BUILD.bazel
+new file mode 100644
+index 0000000..2d7b5f3
+--- /dev/null
++++ b/bazel/BUILD.bazel
+@@ -0,0 +1 @@
++# Empty package to allow loading .bzl files from //bazel
++
+diff --git a/bazel/cc_proto_library.bzl b/bazel/cc_proto_library.bzl
+new file mode 100644
+index 0000000..be1b06d
+--- /dev/null
++++ b/bazel/cc_proto_library.bzl
+@@ -0,0 +1,2 @@
++def cc_proto_library(name, **kwargs):
++    native.cc_library(name = name)
