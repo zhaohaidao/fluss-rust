@@ -16,20 +16,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-set -xe 
+set -xe
 
-DIR="$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)"
+ROOT_DIR="$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)"
+CPP_DIR="$ROOT_DIR/bindings/cpp"
 
-# Set Bazel output base to bazel-build directory
-# This ensures all Bazel outputs are in bazel-build/.bazel-output-base
-BAZEL_OUTPUT_BASE="$DIR/bazel-build/.bazel-output-base"
+# Set Bazel output base to bindings/cpp/bazel-build/.bazel-output-base
+BAZEL_OUTPUT_BASE="$CPP_DIR/bazel-build/.bazel-output-base"
 
 # Create output base directory if it doesn't exist
 mkdir -p "$BAZEL_OUTPUT_BASE"
 
-# Wrapper function to run bazel with --output_base
+# Wrapper function to run bazel from bindings/cpp with a fixed output base
 bazel() {
-    command bazel --output_base="$BAZEL_OUTPUT_BASE" "$@"
+    (cd "$CPP_DIR" && command bazel --output_base="$BAZEL_OUTPUT_BASE" "$@")
 }
 
 compile() {
@@ -42,19 +42,18 @@ build_example() {
 
 run_example() {
     build_example
-    # 传递除第一个参数外的所有参数给 consume_table
-    shift  # 移除 'run' 参数
-    # 传递 RUST_LOG 环境变量以启用日志
+    # Forward all args after 'run' to consume_table
+    shift
     bazel run //:consume_table --action_env=RUST_LOG="${RUST_LOG:-warn}" -- "$@"
 }
 
 clean() {
     bazel clean
     # Remove bazel-* symlinks (Bazel automatically creates these)
-    rm -f "$DIR"/bazel-*
+    rm -f "$CPP_DIR"/bazel-*
     # Also remove the bazel-build directory if it exists
-    if [ -d "$DIR/bazel-build" ]; then
-        rm -rf "$DIR/bazel-build"
+    if [ -d "$CPP_DIR/bazel-build" ]; then
+        rm -rf "$CPP_DIR/bazel-build"
     fi
     echo "Cleaned all Bazel outputs and symlinks"
 }
@@ -73,7 +72,7 @@ show_outputs() {
     echo "  bazel info bazel-bin"
 }
 
-case $1 in 
+case $1 in
     compile )
         compile
         ;;
