@@ -174,13 +174,31 @@ if [[ -f "$META_FILE" ]]; then
     fi
 fi
 
-cat > "$MODULE_ROOT/metadata.json" <<EOF
+METADATA_PATH="$MODULE_ROOT/metadata.json"
+if [[ -f "$METADATA_PATH" ]] && command -v jq >/dev/null 2>&1; then
+    jq \
+        --arg version "$VERSION" \
+        --arg homepage "$HOMEPAGE" \
+        --argjson maintainers "$MAINTAINERS_JSON" \
+        '
+        {
+          homepage: (if (.homepage // "") != "" then .homepage else $homepage end),
+          maintainers: (if ((.maintainers // []) | length) > 0 then .maintainers else $maintainers end),
+          versions: (((.versions // []) + [$version]) | unique | sort)
+        }
+        ' "$METADATA_PATH" > "$METADATA_PATH.tmp"
+    mv "$METADATA_PATH.tmp" "$METADATA_PATH"
+elif [[ -f "$METADATA_PATH" ]]; then
+    echo "WARN: Existing metadata.json found but jq is unavailable. Keep it unchanged and update versions manually." >&2
+else
+    cat > "$METADATA_PATH" <<EOF
 {
   "homepage": "$HOMEPAGE",
   "maintainers": $MAINTAINERS_JSON,
   "versions": ["$VERSION"]
 }
 EOF
+fi
 
 cat > "$OUTPUT_DIR/README.txt" <<EOF
 Bzlmod release assets are ready.
