@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::io::{FileIO, Storage};
 use crate::metadata::TableBucket;
 use crate::proto::{PbRemoteLogFetchInfo, PbRemoteLogSegment};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use std::{
     cmp::{Ordering, Reverse, min},
@@ -31,11 +32,6 @@ use std::{
     time::Duration,
 };
 
-#[cfg(test)]
-use std::{
-    env,
-    time::{SystemTime, UNIX_EPOCH},
-};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
@@ -79,11 +75,17 @@ fn calculate_backoff_delay(retry_count: u32) -> tokio::time::Duration {
     tokio::time::Duration::from_millis(final_ms)
 }
 
-/// Result of a fetch operation containing file path and size
+/// Result of a fetch operation containing remote segment payload and size
 #[derive(Debug)]
 pub struct FetchResult {
-    pub file_path: PathBuf,
+    pub payload: RemoteLogPayload,
     pub file_size: usize,
+}
+
+#[derive(Debug)]
+pub enum RemoteLogPayload {
+    File(PathBuf),
+    Memory(Bytes),
 }
 
 /// Trait for fetching remote log segments (allows dependency injection for testing)
@@ -185,12 +187,10 @@ impl Drop for PrefetchPermit {
     }
 }
 
-/// Downloaded remote log file with prefetch permit
-/// File remains on disk for memory efficiency; file deletion is handled by FileCleanupGuard in FileSource
+/// Downloaded remote log payload with prefetch permit.
 #[derive(Debug)]
 pub struct RemoteLogFile {
-    /// Path to the downloaded file on local disk
-    pub file_path: PathBuf,
+    pub payload: RemoteLogPayload,
     /// Size of the file in bytes
     /// Currently unused but kept for potential future use (logging, metrics, etc.)
     #[allow(dead_code)]
@@ -293,6 +293,7 @@ enum DownloadResult {
 struct ProductionFetcher {
     credentials_rx: CredentialsReceiver,
     local_log_dir: Arc<TempDir>,
+    store_in_memory: bool,
 }
 
 impl RemoteLogFetcher for ProductionFetcher {
@@ -302,6 +303,7 @@ impl RemoteLogFetcher for ProductionFetcher {
     ) -> Pin<Box<dyn Future<Output = Result<FetchResult>> + Send>> {
         let mut credentials_rx = self.credentials_rx.clone();
         let local_log_dir = self.local_log_dir.clone();
+        let store_in_memory = self.store_in_memory;
 
         // Clone data needed for async operation to avoid lifetime issues
         let segment = request.segment.clone();
@@ -355,7 +357,20 @@ impl RemoteLogFetcher for ProductionFetcher {
                 }
             };
 
-            // Download file to disk (streaming, no memory spike)
+            if store_in_memory {
+                let data = RemoteLogDownloader::download_file_to_memory(
+                    &remote_log_tablet_dir,
+                    &remote_path,
+                    &remote_fs_props,
+                )
+                .await?;
+                let file_size = data.len();
+                return Ok(FetchResult {
+                    payload: RemoteLogPayload::Memory(data),
+                    file_size,
+                });
+            }
+
             let file_path = RemoteLogDownloader::download_file(
                 &remote_log_tablet_dir,
                 &remote_path,
@@ -363,14 +378,11 @@ impl RemoteLogFetcher for ProductionFetcher {
                 &remote_fs_props,
             )
             .await?;
-
-            // Get file size
             let metadata = tokio::fs::metadata(&file_path).await?;
             let file_size = metadata.len() as usize;
 
-            // Return file path - file stays on disk until PrefetchPermit is dropped
             Ok(FetchResult {
-                file_path,
+                payload: RemoteLogPayload::File(file_path),
                 file_size,
             })
         })
@@ -498,7 +510,7 @@ async fn spawn_download_task(
             // Success - permit will be released on drop (FileSource handles file deletion)
             DownloadResult::Success {
                 result: RemoteLogFile {
-                    file_path: fetch_result.file_path,
+                    payload: fetch_result.payload,
                     file_size: fetch_result.file_size,
                     permit: PrefetchPermit::new(permit, recycle_notify.clone()),
                 },
@@ -768,11 +780,13 @@ impl RemoteLogDownloader {
         local_log_dir: TempDir,
         max_prefetch_segments: usize,
         max_concurrent_downloads: usize,
+        store_in_memory: bool,
         credentials_rx: CredentialsReceiver,
     ) -> Result<Self> {
         let fetcher = Arc::new(ProductionFetcher {
             credentials_rx,
             local_log_dir: Arc::new(local_log_dir),
+            store_in_memory,
         });
 
         Self::new_with_fetcher(fetcher, max_prefetch_segments, max_concurrent_downloads)
@@ -848,25 +862,19 @@ impl Drop for RemoteLogDownloader {
 }
 
 impl RemoteLogDownloader {
-    /// Download a file from remote storage to local using streaming read/write
-    async fn download_file(
+    fn build_remote_operator(
         remote_log_tablet_dir: &str,
         remote_path: &str,
-        local_path: &Path,
         remote_fs_props: &HashMap<String, String>,
-    ) -> Result<PathBuf> {
-        // Handle both URL (e.g., "s3://bucket/path") and local file paths
-        // If the path doesn't contain "://", treat it as a local file path
+    ) -> Result<(opendal::Operator, String)> {
+        // Handle both URL (e.g., "s3://bucket/path") and local file paths.
         let remote_log_tablet_dir_url = if remote_log_tablet_dir.contains("://") {
             remote_log_tablet_dir.to_string()
         } else {
             format!("file://{remote_log_tablet_dir}")
         };
 
-        // Create FileIO from the remote log tablet dir URL to get the storage
         let file_io_builder = FileIO::from_url(&remote_log_tablet_dir_url)?;
-
-        // For S3/S3A URLs, inject S3 credentials from props
         let file_io_builder = if remote_log_tablet_dir.starts_with("s3://")
             || remote_log_tablet_dir.starts_with("s3a://")
             || remote_log_tablet_dir.starts_with("oss://")
@@ -880,15 +888,37 @@ impl RemoteLogDownloader {
             file_io_builder
         };
 
-        // Build storage and create operator directly
         let storage = Storage::build(file_io_builder)?;
         let (op, relative_path) = storage.create(remote_path)?;
+        Ok((op, relative_path.to_string()))
+    }
+
+    /// Download an entire remote log segment into memory.
+    async fn download_file_to_memory(
+        remote_log_tablet_dir: &str,
+        remote_path: &str,
+        remote_fs_props: &HashMap<String, String>,
+    ) -> Result<Bytes> {
+        let (op, relative_path) =
+            Self::build_remote_operator(remote_log_tablet_dir, remote_path, remote_fs_props)?;
+        Ok(op.read(&relative_path).await?.to_bytes())
+    }
+
+    /// Download a file from remote storage to local using streaming read/write
+    async fn download_file(
+        remote_log_tablet_dir: &str,
+        remote_path: &str,
+        local_path: &Path,
+        remote_fs_props: &HashMap<String, String>,
+    ) -> Result<PathBuf> {
+        let (op, relative_path) =
+            Self::build_remote_operator(remote_log_tablet_dir, remote_path, remote_fs_props)?;
 
         // Timeout for remote storage operations (30 seconds)
         const REMOTE_OP_TIMEOUT: Duration = Duration::from_secs(30);
 
         // Get file metadata to know the size with timeout
-        let meta = op.stat(relative_path).await?;
+        let meta = op.stat(&relative_path).await?;
         let file_size = meta.content_length();
 
         // Create local file for writing
@@ -913,7 +943,7 @@ impl RemoteLogDownloader {
             }
 
             // Read chunk from remote storage with timeout
-            let read_future = op.read_with(relative_path).range(range.clone());
+            let read_future = op.read_with(&relative_path).range(range.clone());
             let chunk = tokio::time::timeout(REMOTE_OP_TIMEOUT, read_future)
                 .await
                 .map_err(|e| {
@@ -1030,17 +1060,8 @@ mod tests {
                     })
                 } else {
                     let fake_data = vec![1, 2, 3, 4];
-                    let temp_dir = env::temp_dir();
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_nanos();
-                    let file_path =
-                        temp_dir.join(format!("fake_segment_{segment_id}_{timestamp}.log"));
-                    tokio::fs::write(&file_path, &fake_data).await?;
-
                     Ok(FetchResult {
-                        file_path,
+                        payload: RemoteLogPayload::Memory(Bytes::from(fake_data.clone())),
                         file_size: fake_data.len(),
                     })
                 }

@@ -542,6 +542,10 @@ impl MemorySource {
         }
     }
 
+    fn from_bytes(data: Bytes) -> Self {
+        Self { data }
+    }
+
     fn read_batch_header(&mut self, pos: usize) -> Result<(i64, usize)> {
         if pos + LOG_OVERHEAD > self.data.len() {
             return Err(Error::UnexpectedError {
@@ -744,6 +748,26 @@ impl LogRecordsBatches {
             current_pos: 0,
             remaining_bytes,
         }
+    }
+
+    /// Create from in-memory bytes with base offset.
+    pub fn from_bytes(data: Bytes, base_offset: usize) -> Result<Self> {
+        if base_offset > data.len() {
+            return Err(Error::UnexpectedError {
+                message: format!(
+                    "base_offset ({base_offset}) exceeds data size ({})",
+                    data.len()
+                ),
+                source: None,
+            });
+        }
+        let source = LogRecordsSource::Memory(MemorySource::from_bytes(data.slice(base_offset..)));
+        let remaining_bytes = source.total_size();
+        Ok(Self {
+            source,
+            current_pos: 0,
+            remaining_bytes,
+        })
     }
 
     /// Create from file.

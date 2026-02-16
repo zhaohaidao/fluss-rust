@@ -19,7 +19,7 @@ use arrow::array::RecordBatch;
 use parking_lot::Mutex;
 
 use crate::client::table::remote_log::{
-    PrefetchPermit, RemoteLogDownloadFuture, RemoteLogFile, RemoteLogSegment,
+    PrefetchPermit, RemoteLogDownloadFuture, RemoteLogFile, RemoteLogPayload, RemoteLogSegment,
 };
 use crate::error::{ApiError, Error, Result};
 use crate::metadata::TableBucket;
@@ -780,33 +780,28 @@ impl PendingFetch for RemotePendingFetch {
         // Take the RemoteLogFile and destructure
         let remote_log_file = self.download_future.take_remote_log_file()?;
         let RemoteLogFile {
-            file_path,
-            file_size: _,
+            payload,
+            file_size,
             permit,
         } = remote_log_file;
+        let pos = self.pos_in_log_segment as usize;
+        if pos > file_size {
+            return Err(Error::UnexpectedError {
+                message: format!("Position {pos} exceeds file size {file_size}"),
+                source: None,
+            });
+        }
 
-        // Open file for streaming (no memory allocation for entire file)
-        let file = std::fs::File::open(&file_path)?;
-        let file_size = file.metadata()?.len() as usize;
-
-        // Create file-backed LogRecordsBatches with cleanup (streaming!)
-        // Data will be read batch-by-batch on-demand, not all at once
-        // FileSource will delete the file when dropped (after file is closed)
-        let log_record_batch =
-            LogRecordsBatches::from_file(file, self.pos_in_log_segment as usize, file_path)?;
-
-        // Calculate size based on position offset
-        let size_in_bytes = if self.pos_in_log_segment > 0 {
-            let pos = self.pos_in_log_segment as usize;
-            if pos >= file_size {
-                return Err(Error::UnexpectedError {
-                    message: format!("Position {pos} exceeds file size {file_size}"),
-                    source: None,
-                });
+        let (log_record_batch, size_in_bytes) = match payload {
+            RemoteLogPayload::File(file_path) => {
+                let file = std::fs::File::open(&file_path)?;
+                let log_record_batch = LogRecordsBatches::from_file(file, pos, file_path)?;
+                (log_record_batch, file_size - pos)
             }
-            file_size - pos
-        } else {
-            file_size
+            RemoteLogPayload::Memory(data) => {
+                let log_record_batch = LogRecordsBatches::from_bytes(data, pos)?;
+                (log_record_batch, file_size - pos)
+            }
         };
 
         // Create DefaultCompletedFetch

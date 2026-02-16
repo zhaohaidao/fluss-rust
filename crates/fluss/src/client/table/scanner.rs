@@ -676,6 +676,7 @@ impl LogFetcher {
             tmp_dir,
             config.scanner_remote_log_prefetch_num,
             config.remote_file_download_thread_num,
+            config.scanner_remote_log_store_in_memory,
             credentials_rx,
         )?);
 

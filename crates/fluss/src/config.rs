@@ -24,8 +24,13 @@ const DEFAULT_WRITER_BATCH_SIZE: i32 = 2 * 1024 * 1024;
 const DEFAULT_RETRIES: i32 = i32::MAX;
 const DEFAULT_PREFETCH_NUM: usize = 4;
 const DEFAULT_DOWNLOAD_THREADS: usize = 3;
+const DEFAULT_SCANNER_REMOTE_LOG_STORE_IN_MEMORY: bool = false;
 
 const DEFAULT_ACKS: &str = "all";
+
+fn default_scanner_remote_log_store_in_memory() -> bool {
+    DEFAULT_SCANNER_REMOTE_LOG_STORE_IN_MEMORY
+}
 
 #[derive(Parser, Debug, Clone, Deserialize, Serialize)]
 #[command(author, version, about, long_about = None)]
@@ -54,6 +59,11 @@ pub struct Config {
     /// Default: 3 (matching Java REMOTE_FILE_DOWNLOAD_THREAD_NUM)
     #[arg(long, default_value_t = DEFAULT_DOWNLOAD_THREADS)]
     pub remote_file_download_thread_num: usize,
+
+    /// If true, remote log segments are kept in memory instead of being spilled to temp files.
+    #[arg(long, default_value_t = DEFAULT_SCANNER_REMOTE_LOG_STORE_IN_MEMORY)]
+    #[serde(default = "default_scanner_remote_log_store_in_memory")]
+    pub scanner_remote_log_store_in_memory: bool,
 }
 
 impl Default for Config {
@@ -66,6 +76,7 @@ impl Default for Config {
             writer_batch_size: DEFAULT_WRITER_BATCH_SIZE,
             scanner_remote_log_prefetch_num: DEFAULT_PREFETCH_NUM,
             remote_file_download_thread_num: DEFAULT_DOWNLOAD_THREADS,
+            scanner_remote_log_store_in_memory: DEFAULT_SCANNER_REMOTE_LOG_STORE_IN_MEMORY,
         }
     }
 }
