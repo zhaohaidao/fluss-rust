@@ -34,7 +34,8 @@ use arrow::{
     array::RecordBatch,
     buffer::Buffer,
     ipc::{
-        reader::{StreamReader, read_record_batch},
+        Block,
+        reader::{FileDecoder, StreamReader, read_record_batch},
         root_as_message,
         writer::StreamWriter,
     },
@@ -47,7 +48,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use bytes::Bytes;
 use crc32c::crc32c;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -891,6 +892,10 @@ impl LogRecordBatch {
     }
 
     pub fn records(&self, read_context: &ReadContext) -> Result<LogRecordIterator> {
+        if read_context.is_from_remote {
+            return self.records_for_remote_log(read_context);
+        }
+
         if self.record_count() == 0 {
             return Ok(LogRecordIterator::empty());
         }
@@ -917,9 +922,9 @@ impl LogRecordBatch {
             return Ok(LogRecordIterator::empty());
         }
 
-        let data = &self.data[RECORDS_OFFSET..];
+        let data = self.data.slice(RECORDS_OFFSET..);
 
-        let record_batch = read_context.record_batch_for_remote_log(data)?;
+        let record_batch = read_context.record_batch_for_remote_log_bytes(data)?;
         let log_record_iterator = match record_batch {
             None => LogRecordIterator::empty(),
             Some(record_batch) => {
@@ -942,6 +947,26 @@ impl LogRecordBatch {
     /// This is more efficient when you need the entire batch rather than
     /// iterating row-by-row.
     pub fn record_batch(&self, read_context: &ReadContext) -> Result<RecordBatch> {
+        if read_context.is_from_remote {
+            if self.record_count() == 0 {
+                return Ok(RecordBatch::new_empty(read_context.target_schema.clone()));
+            }
+            if self.data.len() < RECORDS_OFFSET {
+                return Err(Error::UnexpectedError {
+                    message: format!(
+                        "Corrupt log record batch: data length {} is less than RECORDS_OFFSET {}",
+                        self.data.len(),
+                        RECORDS_OFFSET
+                    ),
+                    source: None,
+                });
+            }
+            let data = self.data.slice(RECORDS_OFFSET..);
+            let maybe_batch = read_context.record_batch_for_remote_log_bytes(data)?;
+            return Ok(maybe_batch
+                .unwrap_or_else(|| RecordBatch::new_empty(read_context.target_schema.clone())));
+        }
+
         if self.record_count() == 0 {
             // Return empty batch with correct schema
             return Ok(RecordBatch::new_empty(read_context.target_schema.clone()));
@@ -1023,6 +1048,96 @@ fn parse_ipc_message(
     let body_buffer = Buffer::from(body_data);
 
     Ok((batch_metadata, body_buffer, message.version()))
+}
+
+fn ipc_message_version(data: &[u8]) -> Result<arrow::ipc::MetadataVersion> {
+    const CONTINUATION_MARKER: u32 = 0xFFFFFFFF;
+
+    if data.len() < 8 {
+        Err(ParseError(format!("Invalid data length: {}", data.len())))?
+    }
+
+    let continuation = LittleEndian::read_u32(&data[0..4]);
+    let metadata_size = LittleEndian::read_u32(&data[4..8]) as usize;
+
+    if continuation != CONTINUATION_MARKER {
+        Err(ParseError(format!(
+            "Invalid continuation marker: {continuation}"
+        )))?
+    }
+
+    if data.len() < 8 + metadata_size {
+        Err(ParseError(format!(
+            "Invalid data length. Remaining data length {} is shorter than specified size {}",
+            data.len() - 8,
+            metadata_size
+        )))?
+    }
+
+    let metadata_bytes = &data[8..8 + metadata_size];
+    let message = root_as_message(metadata_bytes).map_err(|err| ParseError(err.to_string()))?;
+    Ok(message.version())
+}
+
+fn ipc_meta_padded_len(data: &[u8]) -> Result<usize> {
+    const CONTINUATION_MARKER: u32 = 0xFFFFFFFF;
+
+    if data.len() < 8 {
+        Err(ParseError(format!("Invalid data length: {}", data.len())))?
+    }
+
+    let continuation = LittleEndian::read_u32(&data[0..4]);
+    let metadata_size = LittleEndian::read_u32(&data[4..8]) as usize;
+
+    if continuation != CONTINUATION_MARKER {
+        Err(ParseError(format!(
+            "Invalid continuation marker: {continuation}"
+        )))?
+    }
+
+    let metadata_padded_size = (metadata_size + 7) & !7;
+    let meta_len = 8 + metadata_padded_size;
+    if data.len() < meta_len {
+        Err(ParseError(format!(
+            "Invalid data length. Remaining data length {} is shorter than specified size {}",
+            data.len() - 8,
+            metadata_size
+        )))?
+    }
+    Ok(meta_len)
+}
+
+fn read_record_batch_with_projection(
+    data: &Bytes,
+    schema: SchemaRef,
+    projection: Option<&[usize]>,
+    version: arrow::ipc::MetadataVersion,
+) -> Result<RecordBatch> {
+    let meta_len = ipc_meta_padded_len(data.as_ref())?;
+    let body_len = data.len().saturating_sub(meta_len);
+    let meta_len_i32 = i32::try_from(meta_len).map_err(|_| Error::UnexpectedError {
+        message: format!("Metadata length {meta_len} exceeds i32::MAX"),
+        source: None,
+    })?;
+    let block = Block::new(0, meta_len_i32, body_len as i64);
+    let buffer = Buffer::from(data.clone());
+    let mut decoder = FileDecoder::new(schema, version).with_require_alignment(false);
+    if let Some(projection) = projection {
+        decoder = decoder.with_projection(projection.to_vec());
+    }
+
+    match decoder.read_record_batch(&block, &buffer)? {
+        Some(batch) => Ok(batch),
+        None => Err(Error::UnexpectedError {
+            message: "Empty record batch is not expected".to_string(),
+            source: None,
+        }),
+    }
+}
+
+fn has_duplicate_projection_indexes(projection: &[usize]) -> bool {
+    let mut seen = HashSet::with_capacity(projection.len());
+    projection.iter().any(|index| !seen.insert(*index))
 }
 
 pub fn to_arrow_schema(fluss_schema: &RowType) -> Result<SchemaRef> {
@@ -1358,27 +1473,39 @@ impl ReadContext {
     }
 
     pub fn record_batch_for_remote_log(&self, data: &[u8]) -> Result<Option<RecordBatch>> {
-        let (batch_metadata, body_buffer, version) = parse_ipc_message(data)?;
+        self.record_batch_for_remote_log_bytes(Bytes::copy_from_slice(data))
+    }
 
-        let record_batch = read_record_batch(
-            &body_buffer,
-            batch_metadata,
+    pub fn record_batch_for_remote_log_bytes(&self, data: Bytes) -> Result<Option<RecordBatch>> {
+        let decode_projection = self.projection.as_ref().and_then(|projection| {
+            if has_duplicate_projection_indexes(&projection.projected_fields) {
+                None
+            } else {
+                Some(projection.projected_fields.as_slice())
+            }
+        });
+        let needs_post_projection = self.projection.is_some() && decode_projection.is_none();
+        let version = ipc_message_version(data.as_ref())?;
+        let record_batch = read_record_batch_with_projection(
+            &data,
             self.full_schema.clone(),
-            &HashMap::new(),
-            None,
-            &version,
+            decode_projection,
+            version,
         )?;
 
-        let record_batch = match &self.projection {
-            Some(projection) => {
-                let projected_columns: Vec<_> = projection
-                    .projected_fields
-                    .iter()
-                    .map(|&idx| record_batch.column(idx).clone())
-                    .collect();
-                RecordBatch::try_new(self.target_schema.clone(), projected_columns)?
-            }
-            None => record_batch,
+        let record_batch = if needs_post_projection {
+            let projection = self
+                .projection
+                .as_ref()
+                .expect("projection must exist when post projection is required");
+            let projected_columns: Vec<_> = projection
+                .projected_fields
+                .iter()
+                .map(|&idx| record_batch.column(idx).clone())
+                .collect();
+            RecordBatch::try_new(self.target_schema.clone(), projected_columns)?
+        } else {
+            record_batch
         };
         Ok(Some(record_batch))
     }
@@ -2004,6 +2131,134 @@ mod tests {
                 .value(0),
             1609459200000987654
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_log_projection_keeps_requested_order() -> Result<()> {
+        use crate::client::WriteRecord;
+        use crate::compression::{
+            ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+        };
+        use crate::metadata::{PhysicalTablePath, TablePath};
+        use crate::row::{GenericRow, InternalRow};
+
+        let row_type = RowType::new(vec![
+            DataField::new("id".to_string(), DataTypes::int(), None),
+            DataField::new("name".to_string(), DataTypes::string(), None),
+            DataField::new("score".to_string(), DataTypes::int(), None),
+        ]);
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_table_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path)));
+
+        let mut builder = MemoryLogRecordsArrowBuilder::new(
+            1,
+            &row_type,
+            false,
+            ArrowCompressionInfo {
+                compression_type: ArrowCompressionType::None,
+                compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+            },
+        )?;
+
+        let mut row = GenericRow::new(3);
+        row.set_field(0, 1_i32);
+        row.set_field(1, "alice");
+        row.set_field(2, 30_i32);
+        builder.append(&WriteRecord::for_append(
+            Arc::clone(&table_info),
+            physical_table_path.clone(),
+            1,
+            &row,
+        ))?;
+
+        let mut row2 = GenericRow::new(3);
+        row2.set_field(0, 2_i32);
+        row2.set_field(1, "bob");
+        row2.set_field(2, 40_i32);
+        builder.append(&WriteRecord::for_append(
+            Arc::clone(&table_info),
+            physical_table_path,
+            2,
+            &row2,
+        ))?;
+
+        let data = builder.build()?;
+        let mut batches = LogRecordsBatches::new(data);
+        let batch = batches.next().expect("expected one log batch")?;
+        let read_context =
+            ReadContext::with_projection_pushdown(to_arrow_schema(&row_type)?, vec![2, 0], true)?;
+
+        let mut records = batch.records_for_remote_log(&read_context)?;
+        let first = records.next().expect("expected first record");
+        assert_eq!(first.row().get_field_count(), 2);
+        assert_eq!(first.row().get_int(0), 30);
+        assert_eq!(first.row().get_int(1), 1);
+
+        let second = records.next().expect("expected second record");
+        assert_eq!(second.row().get_field_count(), 2);
+        assert_eq!(second.row().get_int(0), 40);
+        assert_eq!(second.row().get_int(1), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_log_projection_preserves_duplicate_columns() -> Result<()> {
+        use crate::client::WriteRecord;
+        use crate::compression::{
+            ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+        };
+        use crate::metadata::{PhysicalTablePath, TablePath};
+        use crate::row::{GenericRow, InternalRow};
+
+        let row_type = RowType::new(vec![
+            DataField::new("id".to_string(), DataTypes::int(), None),
+            DataField::new("name".to_string(), DataTypes::string(), None),
+            DataField::new("score".to_string(), DataTypes::int(), None),
+        ]);
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_table_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path)));
+
+        let mut builder = MemoryLogRecordsArrowBuilder::new(
+            1,
+            &row_type,
+            false,
+            ArrowCompressionInfo {
+                compression_type: ArrowCompressionType::None,
+                compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+            },
+        )?;
+
+        let mut row = GenericRow::new(3);
+        row.set_field(0, 1_i32);
+        row.set_field(1, "alice");
+        row.set_field(2, 30_i32);
+        builder.append(&WriteRecord::for_append(
+            Arc::clone(&table_info),
+            physical_table_path,
+            1,
+            &row,
+        ))?;
+
+        let data = builder.build()?;
+        let mut batches = LogRecordsBatches::new(data);
+        let batch = batches.next().expect("expected one log batch")?;
+        let read_context = ReadContext::with_projection_pushdown(
+            to_arrow_schema(&row_type)?,
+            vec![2, 2, 0],
+            true,
+        )?;
+
+        let mut records = batch.records_for_remote_log(&read_context)?;
+        let first = records.next().expect("expected first record");
+        assert_eq!(first.row().get_field_count(), 3);
+        assert_eq!(first.row().get_int(0), 30);
+        assert_eq!(first.row().get_int(1), 30);
+        assert_eq!(first.row().get_int(2), 1);
 
         Ok(())
     }
