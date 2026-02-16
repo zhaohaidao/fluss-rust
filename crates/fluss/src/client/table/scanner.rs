@@ -30,8 +30,8 @@ use crate::client::connection::FlussConnection;
 use crate::client::credentials::SecurityTokenManager;
 use crate::client::metadata::Metadata;
 use crate::client::table::log_fetch_buffer::{
-    CompletedFetch, DefaultCompletedFetch, FetchErrorAction, FetchErrorContext, FetchErrorLogLevel,
-    LogFetchBuffer, RemotePendingFetch,
+    CompletedFetch, DecodePool, DefaultCompletedFetch, FetchErrorAction, FetchErrorContext,
+    FetchErrorLogLevel, LogFetchBuffer, RemotePendingFetch,
 };
 use crate::client::table::remote_log::{RemoteLogDownloader, RemoteLogFetchInfo};
 use crate::error::Error::UnsupportedOperation;
@@ -635,6 +635,8 @@ struct LogFetcher {
     #[allow(dead_code)]
     security_token_manager: Arc<SecurityTokenManager>,
     log_fetch_buffer: Arc<LogFetchBuffer>,
+    decode_pool: Option<Arc<DecodePool>>,
+    decode_inflight_limit: usize,
     nodes_with_pending_fetch_requests: Arc<Mutex<HashSet<i32>>>,
 }
 
@@ -645,6 +647,8 @@ struct FetchResponseContext {
     read_context: ReadContext,
     remote_read_context: ReadContext,
     remote_log_downloader: Arc<RemoteLogDownloader>,
+    decode_pool: Option<Arc<DecodePool>>,
+    decode_inflight_limit: usize,
 }
 
 impl LogFetcher {
@@ -664,6 +668,15 @@ impl LogFetcher {
 
         let tmp_dir = TempDir::with_prefix("fluss-remote-logs")?;
         let log_fetch_buffer = Arc::new(LogFetchBuffer::new(read_context.clone()));
+        let decode_pool = if config.scanner_decode_threads > 0 {
+            Some(DecodePool::new(
+                config.scanner_decode_threads,
+                config.scanner_decode_queue_capacity,
+            ))
+        } else {
+            None
+        };
+        let decode_inflight_limit = config.scanner_decode_inflight_per_fetch.max(1);
 
         // Create security token manager for background token refresh
         let security_token_manager =
@@ -693,6 +706,8 @@ impl LogFetcher {
             remote_log_downloader,
             security_token_manager,
             log_fetch_buffer,
+            decode_pool,
+            decode_inflight_limit,
             nodes_with_pending_fetch_requests: Arc::new(Mutex::new(HashSet::new())),
         })
     }
@@ -860,6 +875,8 @@ impl LogFetcher {
                 read_context,
                 remote_read_context,
                 remote_log_downloader,
+                decode_pool: self.decode_pool.clone(),
+                decode_inflight_limit: self.decode_inflight_limit,
             };
             // Spawn async task to handle the fetch request
             // Note: These tasks are not explicitly tracked or cancelled when LogFetcher is dropped.
@@ -934,6 +951,8 @@ impl LogFetcher {
             read_context,
             remote_read_context,
             remote_log_downloader,
+            decode_pool,
+            decode_inflight_limit,
         } = context;
 
         for pb_fetch_log_resp in fetch_response.tables_resp {
@@ -1017,6 +1036,8 @@ impl LogFetcher {
                         remote_log_downloader.clone(),
                         log_fetch_buffer.clone(),
                         remote_read_context.clone(),
+                        decode_pool.clone(),
+                        decode_inflight_limit,
                         &table_bucket,
                         remote_fetch_info,
                         fetch_offset,
@@ -1036,6 +1057,8 @@ impl LogFetcher {
                         read_context.clone(),
                         fetch_offset,
                         high_watermark,
+                        decode_pool.clone(),
+                        decode_inflight_limit,
                     );
                     log_fetch_buffer.add(Box::new(completed_fetch));
                 }
@@ -1047,6 +1070,8 @@ impl LogFetcher {
         remote_log_downloader: Arc<RemoteLogDownloader>,
         log_fetch_buffer: Arc<LogFetchBuffer>,
         read_context: ReadContext,
+        decode_pool: Option<Arc<DecodePool>>,
+        decode_inflight_limit: usize,
         table_bucket: &TableBucket,
         remote_fetch_info: RemoteLogFetchInfo,
         fetch_offset: i64,
@@ -1083,6 +1108,8 @@ impl LogFetcher {
                 current_fetch_offset,
                 high_watermark,
                 read_context.clone(),
+                decode_pool.clone(),
+                decode_inflight_limit,
             );
             // Add to pending fetches in buffer (similar to Java's logFetchBuffer.pend)
             log_fetch_buffer.pend(Box::new(pending_fetch));
@@ -1748,8 +1775,16 @@ mod tests {
         let data = build_records(&table_info, Arc::new(table_path))?;
         let log_records = LogRecordsBatches::new(data.clone());
         let read_context = ReadContext::new(to_arrow_schema(table_info.get_row_type())?, false);
-        let completed =
-            DefaultCompletedFetch::new(bucket.clone(), log_records, data.len(), read_context, 0, 0);
+        let completed = DefaultCompletedFetch::new(
+            bucket.clone(),
+            log_records,
+            data.len(),
+            read_context,
+            0,
+            0,
+            None,
+            0,
+        );
         fetcher.log_fetch_buffer.add(Box::new(completed));
 
         let fetched = fetcher.collect_fetches()?;
@@ -1784,6 +1819,8 @@ mod tests {
             data.len(),
             read_context,
             0,
+            0,
+            None,
             0,
         ));
 
@@ -1857,6 +1894,8 @@ mod tests {
             read_context: fetcher.read_context.clone(),
             remote_read_context: fetcher.remote_read_context.clone(),
             remote_log_downloader: fetcher.remote_log_downloader.clone(),
+            decode_pool: fetcher.decode_pool.clone(),
+            decode_inflight_limit: fetcher.decode_inflight_limit,
         };
 
         LogFetcher::handle_fetch_response(response, response_context).await;
@@ -1910,6 +1949,8 @@ mod tests {
             read_context: fetcher.read_context.clone(),
             remote_read_context: fetcher.remote_read_context.clone(),
             remote_log_downloader: fetcher.remote_log_downloader.clone(),
+            decode_pool: fetcher.decode_pool.clone(),
+            decode_inflight_limit: fetcher.decode_inflight_limit,
         };
 
         LogFetcher::handle_fetch_response(response, response_context).await;

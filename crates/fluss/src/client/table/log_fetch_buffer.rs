@@ -27,14 +27,162 @@ use crate::record::{
     LogRecordBatch, LogRecordIterator, LogRecordsBatches, ReadContext, ScanRecord,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender, TryRecvError},
     },
+    thread,
     time::{Duration, Instant},
 };
 use tokio::sync::Notify;
+
+pub(crate) struct DecodeTask {
+    pub(crate) seq: u64,
+    pub(crate) log_batch: LogRecordBatch,
+    pub(crate) read_context: ReadContext,
+    pub(crate) skip_count: usize,
+    pub(crate) effective_base_offset: i64,
+    pub(crate) next_fetch_offset: i64,
+    pub(crate) result_tx: Sender<DecodeResult>,
+}
+
+pub(crate) struct DecodedBatch {
+    pub(crate) record_batch: RecordBatch,
+    pub(crate) base_offset: i64,
+    pub(crate) next_fetch_offset: i64,
+}
+
+pub(crate) struct DecodeResult {
+    pub(crate) seq: u64,
+    pub(crate) result: Result<DecodedBatch>,
+}
+
+pub(crate) struct DecodePool {
+    queue: Arc<DecodeQueue>,
+}
+
+impl DecodePool {
+    pub(crate) fn new(threads: usize, queue_capacity: usize) -> Arc<Self> {
+        let queue = Arc::new(DecodeQueue::new(queue_capacity.max(1)));
+        let pool = Arc::new(DecodePool {
+            queue: queue.clone(),
+        });
+        for _ in 0..threads.max(1) {
+            let queue = queue.clone();
+            thread::spawn(move || decode_worker(queue));
+        }
+        pool
+    }
+
+    pub(crate) fn submit(&self, task: DecodeTask) -> Result<()> {
+        self.queue.push(task)
+    }
+}
+
+struct DecodeQueue {
+    inner: StdMutex<VecDeque<DecodeTask>>,
+    not_empty: Condvar,
+    not_full: Condvar,
+    capacity: usize,
+    closed: AtomicBool,
+}
+
+impl DecodeQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: StdMutex::new(VecDeque::new()),
+            not_empty: Condvar::new(),
+            not_full: Condvar::new(),
+            capacity,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn push(&self, task: DecodeTask) -> Result<()> {
+        let mut guard = self.inner.lock().map_err(|_| Error::UnexpectedError {
+            message: "Decode queue poisoned".to_string(),
+            source: None,
+        })?;
+        while guard.len() >= self.capacity && !self.closed.load(Ordering::Acquire) {
+            guard = self
+                .not_full
+                .wait(guard)
+                .map_err(|_| Error::UnexpectedError {
+                    message: "Decode queue wait failed".to_string(),
+                    source: None,
+                })?;
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::UnexpectedError {
+                message: "Decode queue closed".to_string(),
+                source: None,
+            });
+        }
+        guard.push_back(task);
+        self.not_empty.notify_one();
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<DecodeTask> {
+        let mut guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+        while guard.is_empty() && !self.closed.load(Ordering::Acquire) {
+            guard = match self.not_empty.wait(guard) {
+                Ok(guard) => guard,
+                Err(_) => return None,
+            };
+        }
+        let task = guard.pop_front();
+        if task.is_some() {
+            self.not_full.notify_one();
+        }
+        task
+    }
+}
+
+fn decode_worker(queue: Arc<DecodeQueue>) {
+    while let Some(task) = queue.pop() {
+        let result = decode_task(
+            task.log_batch,
+            &task.read_context,
+            task.skip_count,
+            task.effective_base_offset,
+            task.next_fetch_offset,
+        );
+        let _ = task.result_tx.send(DecodeResult {
+            seq: task.seq,
+            result,
+        });
+    }
+}
+
+fn decode_task(
+    log_batch: LogRecordBatch,
+    read_context: &ReadContext,
+    skip_count: usize,
+    effective_base_offset: i64,
+    next_fetch_offset: i64,
+) -> Result<DecodedBatch> {
+    let mut record_batch = log_batch.record_batch(read_context)?;
+    if skip_count > 0 {
+        if skip_count >= record_batch.num_rows() {
+            return Err(Error::UnexpectedError {
+                message: "Skip count exceeds decoded batch rows".to_string(),
+                source: None,
+            });
+        }
+        record_batch = record_batch.slice(skip_count, record_batch.num_rows() - skip_count);
+    }
+    Ok(DecodedBatch {
+        record_batch,
+        base_offset: effective_base_offset,
+        next_fetch_offset,
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FetchErrorAction {
@@ -340,12 +488,21 @@ pub struct DefaultCompletedFetch {
     error: Option<Error>,
     log_record_batch: LogRecordsBatches,
     read_context: ReadContext,
+    decode_pool: Option<Arc<DecodePool>>,
+    decode_inflight_limit: usize,
     next_fetch_offset: i64,
     high_watermark: i64,
     size_in_bytes: usize,
     consumed: bool,
     initialized: bool,
     records_read: usize,
+    decode_seq: u64,
+    decode_expected_seq: u64,
+    decode_inflight: usize,
+    pending_decoded: BTreeMap<u64, Result<DecodedBatch>>,
+    decode_rx: Option<StdMutex<Receiver<DecodeResult>>>,
+    decode_tx: Option<Sender<DecodeResult>>,
+    no_more_raw_batches: bool,
     current_record_iterator: Option<LogRecordIterator>,
     current_record_batch: Option<LogRecordBatch>,
     last_record: Option<ScanRecord>,
@@ -361,7 +518,15 @@ impl DefaultCompletedFetch {
         read_context: ReadContext,
         fetch_offset: i64,
         high_watermark: i64,
+        decode_pool: Option<Arc<DecodePool>>,
+        decode_inflight_limit: usize,
     ) -> Self {
+        let (decode_tx, decode_rx) = if decode_pool.is_some() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            (Some(tx), Some(StdMutex::new(rx)))
+        } else {
+            (None, None)
+        };
         Self {
             table_bucket,
             api_error: None,
@@ -369,12 +534,21 @@ impl DefaultCompletedFetch {
             error: None,
             log_record_batch,
             read_context,
+            decode_pool,
+            decode_inflight_limit: decode_inflight_limit.max(1),
             next_fetch_offset: fetch_offset,
             high_watermark,
             size_in_bytes,
             consumed: false,
             initialized: false,
             records_read: 0,
+            decode_seq: 0,
+            decode_expected_seq: 0,
+            decode_inflight: 0,
+            pending_decoded: BTreeMap::new(),
+            decode_rx,
+            decode_tx,
+            no_more_raw_batches: false,
             current_record_iterator: None,
             current_record_batch: None,
             last_record: None,
@@ -396,12 +570,21 @@ impl DefaultCompletedFetch {
             error: Some(error),
             log_record_batch: LogRecordsBatches::new(Vec::new()),
             read_context,
+            decode_pool: None,
+            decode_inflight_limit: 0,
             next_fetch_offset: fetch_offset,
             high_watermark: -1,
             size_in_bytes: 0,
             consumed: false,
             initialized: false,
             records_read: 0,
+            decode_seq: 0,
+            decode_expected_seq: 0,
+            decode_inflight: 0,
+            pending_decoded: BTreeMap::new(),
+            decode_rx: None,
+            decode_tx: None,
+            no_more_raw_batches: true,
             current_record_iterator: None,
             current_record_batch: None,
             last_record: None,
@@ -424,12 +607,21 @@ impl DefaultCompletedFetch {
             error: None,
             log_record_batch: LogRecordsBatches::new(Vec::new()),
             read_context,
+            decode_pool: None,
+            decode_inflight_limit: 0,
             next_fetch_offset: fetch_offset,
             high_watermark: -1,
             size_in_bytes: 0,
             consumed: false,
             initialized: false,
             records_read: 0,
+            decode_seq: 0,
+            decode_expected_seq: 0,
+            decode_inflight: 0,
+            pending_decoded: BTreeMap::new(),
+            decode_rx: None,
+            decode_tx: None,
+            no_more_raw_batches: true,
             current_record_iterator: None,
             current_record_batch: None,
             last_record: None,
@@ -512,6 +704,134 @@ impl DefaultCompletedFetch {
             return Ok(Some((record_batch, effective_base_offset)));
         }
     }
+
+    fn decode_enabled(&self) -> bool {
+        self.decode_pool.is_some()
+    }
+
+    fn drain_decode_results(&mut self) {
+        let Some(rx) = self.decode_rx.as_ref() else {
+            return;
+        };
+        let guard = match rx.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        loop {
+            match guard.try_recv() {
+                Ok(result) => {
+                    self.pending_decoded.insert(result.seq, result.result);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn next_decode_task(&mut self) -> Result<Option<DecodeTask>> {
+        loop {
+            let Some(log_batch_result) = self.log_record_batch.next() else {
+                self.no_more_raw_batches = true;
+                return Ok(None);
+            };
+
+            let log_batch = log_batch_result?;
+            let record_count = log_batch.record_count();
+            if record_count == 0 {
+                continue;
+            }
+
+            let log_base_offset = log_batch.base_log_offset();
+            let skip_count = if self.next_fetch_offset > log_base_offset {
+                (self.next_fetch_offset - log_base_offset) as usize
+            } else {
+                0
+            };
+
+            if skip_count >= record_count as usize {
+                continue;
+            }
+
+            let effective_base_offset = if skip_count > 0 {
+                self.next_fetch_offset
+            } else {
+                log_base_offset
+            };
+
+            let Some(result_tx) = self.decode_tx.as_ref() else {
+                return Ok(None);
+            };
+            let next_fetch_offset = log_batch.next_log_offset();
+            let task = DecodeTask {
+                seq: self.decode_seq,
+                log_batch,
+                read_context: self.read_context.clone(),
+                skip_count,
+                effective_base_offset,
+                next_fetch_offset,
+                result_tx: result_tx.clone(),
+            };
+            self.decode_seq += 1;
+            return Ok(Some(task));
+        }
+    }
+
+    fn fetch_batches_parallel(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+
+        if let Some(api_error) = self.api_error.as_ref() {
+            return Err(Error::FlussAPIError {
+                api_error: ApiError {
+                    code: api_error.code,
+                    message: api_error.message.clone(),
+                },
+            });
+        }
+
+        if self.consumed {
+            return Ok(Vec::new());
+        }
+
+        self.drain_decode_results();
+
+        if let Some(pool) = self.decode_pool.clone() {
+            while self.decode_inflight < self.decode_inflight_limit {
+                if self.decode_inflight >= max_batches {
+                    break;
+                }
+                let Some(task) = self.next_decode_task()? else {
+                    break;
+                };
+                pool.submit(task)?;
+                self.decode_inflight += 1;
+            }
+        }
+
+        let mut batches = Vec::with_capacity(max_batches.min(16));
+        while batches.len() < max_batches {
+            let Some(entry) = self.pending_decoded.remove(&self.decode_expected_seq) else {
+                break;
+            };
+            let decoded = entry?;
+            self.decode_expected_seq += 1;
+            self.decode_inflight = self.decode_inflight.saturating_sub(1);
+            self.next_fetch_offset = decoded.next_fetch_offset;
+            self.records_read += decoded.record_batch.num_rows();
+            batches.push((decoded.record_batch, decoded.base_offset));
+        }
+
+        if self.no_more_raw_batches
+            && self.decode_inflight == 0
+            && self.pending_decoded.is_empty()
+            && batches.is_empty()
+        {
+            self.drain();
+        }
+
+        Ok(batches)
+    }
 }
 
 impl CompletedFetch for DefaultCompletedFetch {
@@ -590,6 +910,9 @@ impl CompletedFetch for DefaultCompletedFetch {
     }
 
     fn fetch_batches(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
+        if self.decode_enabled() {
+            return self.fetch_batches_parallel(max_batches);
+        }
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -635,6 +958,9 @@ impl CompletedFetch for DefaultCompletedFetch {
         self.cached_record_error = None;
         self.corrupt_last_record = false;
         self.last_record = None;
+        self.pending_decoded.clear();
+        self.decode_rx = None;
+        self.decode_tx = None;
     }
 
     fn size_in_bytes(&self) -> usize {
@@ -745,6 +1071,8 @@ pub struct RemotePendingFetch {
     fetch_offset: i64,
     high_watermark: i64,
     read_context: ReadContext,
+    decode_pool: Option<Arc<DecodePool>>,
+    decode_inflight_limit: usize,
 }
 
 impl RemotePendingFetch {
@@ -755,6 +1083,8 @@ impl RemotePendingFetch {
         fetch_offset: i64,
         high_watermark: i64,
         read_context: ReadContext,
+        decode_pool: Option<Arc<DecodePool>>,
+        decode_inflight_limit: usize,
     ) -> Self {
         Self {
             segment,
@@ -763,6 +1093,8 @@ impl RemotePendingFetch {
             fetch_offset,
             high_watermark,
             read_context,
+            decode_pool,
+            decode_inflight_limit,
         }
     }
 }
@@ -817,6 +1149,8 @@ impl PendingFetch for RemotePendingFetch {
             self.read_context,
             self.fetch_offset,
             self.high_watermark,
+            self.decode_pool.clone(),
+            self.decode_inflight_limit,
         );
 
         // Wrap it with RemoteCompletedFetch to hold the permit
@@ -925,6 +1259,8 @@ mod tests {
             data.len(),
             read_context,
             0,
+            0,
+            None,
             0,
         );
 

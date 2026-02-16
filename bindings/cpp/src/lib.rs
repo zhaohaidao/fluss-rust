@@ -493,6 +493,9 @@ fn new_connection(config: &ffi::FfiConfig) -> Result<*mut Connection, String> {
         writer_batch_size: config.writer_batch_size,
         scanner_remote_log_prefetch_num: config.scanner_remote_log_prefetch_num,
         remote_file_download_thread_num: config.remote_file_download_thread_num,
+        scanner_decode_threads: 0,
+        scanner_decode_queue_capacity: 256,
+        scanner_decode_inflight_per_fetch: 4,
     };
 
     let conn = RUNTIME.block_on(async { fcore::client::FlussConnection::new(config).await });
