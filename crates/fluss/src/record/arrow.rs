@@ -899,11 +899,13 @@ impl LogRecordBatch {
 
         let record_batch = read_context.record_batch(data)?;
         let arrow_reader = ArrowReader::new(Arc::new(record_batch));
+        let row_count = arrow_reader.row_count();
         let log_record_iterator = LogRecordIterator::Arrow(ArrowLogRecordIterator {
             reader: arrow_reader,
             base_offset: self.base_log_offset(),
             timestamp: self.commit_timestamp(),
             row_id: 0,
+            row_count,
             change_type: ChangeType::AppendOnly,
         });
 
@@ -922,11 +924,13 @@ impl LogRecordBatch {
             None => LogRecordIterator::empty(),
             Some(record_batch) => {
                 let arrow_reader = ArrowReader::new(Arc::new(record_batch));
+                let row_count = arrow_reader.row_count();
                 LogRecordIterator::Arrow(ArrowLogRecordIterator {
                     reader: arrow_reader,
                     base_offset: self.base_log_offset(),
                     timestamp: self.commit_timestamp(),
                     row_id: 0,
+                    row_count,
                     change_type: ChangeType::AppendOnly,
                 })
             }
@@ -1389,6 +1393,33 @@ impl LogRecordIterator {
     pub fn empty() -> Self {
         LogRecordIterator::Empty
     }
+
+    pub(crate) fn from_record_batch(
+        record_batch: RecordBatch,
+        base_offset: i64,
+        timestamp: i64,
+        change_type: ChangeType,
+    ) -> Self {
+        let reader = ArrowReader::new(Arc::new(record_batch));
+        LogRecordIterator::Arrow(ArrowLogRecordIterator::new(
+            reader,
+            base_offset,
+            timestamp,
+            change_type,
+        ))
+    }
+
+    pub(crate) fn drain_to(
+        &mut self,
+        out: &mut Vec<ScanRecord>,
+        max_records: usize,
+        min_offset: i64,
+    ) -> (usize, usize, bool) {
+        match self {
+            LogRecordIterator::Empty => (0, 0, true),
+            LogRecordIterator::Arrow(iter) => iter.drain_to(out, max_records, min_offset),
+        }
+    }
 }
 
 impl Iterator for LogRecordIterator {
@@ -1407,19 +1438,50 @@ pub struct ArrowLogRecordIterator {
     base_offset: i64,
     timestamp: i64,
     row_id: usize,
+    row_count: usize,
     change_type: ChangeType,
 }
 
 #[allow(dead_code)]
 impl ArrowLogRecordIterator {
     fn new(reader: ArrowReader, base_offset: i64, timestamp: i64, change_type: ChangeType) -> Self {
+        let row_count = reader.row_count();
         Self {
             reader,
             base_offset,
             timestamp,
             row_id: 0,
+            row_count,
             change_type,
         }
+    }
+
+    pub(crate) fn drain_to(
+        &mut self,
+        out: &mut Vec<ScanRecord>,
+        max_records: usize,
+        min_offset: i64,
+    ) -> (usize, usize, bool) {
+        let mut advanced = 0usize;
+        let mut appended = 0usize;
+        while out.len() < max_records && self.row_id < self.row_count {
+            let row_id = self.row_id;
+            let offset = self.base_offset + row_id as i64;
+            self.row_id += 1;
+            advanced = advanced.saturating_add(1);
+            if offset < min_offset {
+                continue;
+            }
+            let row = self.reader.read(row_id);
+            out.push(ScanRecord::new(
+                row,
+                offset,
+                self.timestamp,
+                self.change_type,
+            ));
+            appended = appended.saturating_add(1);
+        }
+        (advanced, appended, self.row_id >= self.row_count)
     }
 }
 
@@ -1427,7 +1489,7 @@ impl Iterator for ArrowLogRecordIterator {
     type Item = ScanRecord;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.row_id >= self.reader.row_count() {
+        if self.row_id >= self.row_count {
             return None;
         }
 

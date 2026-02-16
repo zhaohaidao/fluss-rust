@@ -24,7 +24,7 @@ use crate::client::table::remote_log::{
 use crate::error::{ApiError, Error, Result};
 use crate::metadata::TableBucket;
 use crate::record::{
-    LogRecordBatch, LogRecordIterator, LogRecordsBatches, ReadContext, ScanRecord,
+    ChangeType, LogRecordBatch, LogRecordIterator, LogRecordsBatches, ReadContext, ScanRecord,
 };
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -45,6 +45,8 @@ pub(crate) struct DecodeTask {
     pub(crate) skip_count: usize,
     pub(crate) effective_base_offset: i64,
     pub(crate) next_fetch_offset: i64,
+    pub(crate) commit_timestamp: i64,
+    pub(crate) change_type: ChangeType,
     pub(crate) result_tx: Sender<DecodeResult>,
 }
 
@@ -52,6 +54,8 @@ pub(crate) struct DecodedBatch {
     pub(crate) record_batch: RecordBatch,
     pub(crate) base_offset: i64,
     pub(crate) next_fetch_offset: i64,
+    pub(crate) commit_timestamp: i64,
+    pub(crate) change_type: ChangeType,
 }
 
 pub(crate) struct DecodeResult {
@@ -152,6 +156,8 @@ fn decode_worker(queue: Arc<DecodeQueue>) {
             task.skip_count,
             task.effective_base_offset,
             task.next_fetch_offset,
+            task.commit_timestamp,
+            task.change_type,
         );
         let _ = task.result_tx.send(DecodeResult {
             seq: task.seq,
@@ -166,6 +172,8 @@ fn decode_task(
     skip_count: usize,
     effective_base_offset: i64,
     next_fetch_offset: i64,
+    commit_timestamp: i64,
+    change_type: ChangeType,
 ) -> Result<DecodedBatch> {
     let mut record_batch = log_batch.record_batch(read_context)?;
     if skip_count > 0 {
@@ -181,6 +189,8 @@ fn decode_task(
         record_batch,
         base_offset: effective_base_offset,
         next_fetch_offset,
+        commit_timestamp,
+        change_type,
     })
 }
 
@@ -500,6 +510,7 @@ pub struct DefaultCompletedFetch {
     decode_expected_seq: u64,
     decode_inflight: usize,
     pending_decoded: BTreeMap<u64, Result<DecodedBatch>>,
+    ready_decoded_batches: VecDeque<DecodedBatch>,
     decode_rx: Option<StdMutex<Receiver<DecodeResult>>>,
     decode_tx: Option<Sender<DecodeResult>>,
     no_more_raw_batches: bool,
@@ -546,6 +557,7 @@ impl DefaultCompletedFetch {
             decode_expected_seq: 0,
             decode_inflight: 0,
             pending_decoded: BTreeMap::new(),
+            ready_decoded_batches: VecDeque::new(),
             decode_rx,
             decode_tx,
             no_more_raw_batches: false,
@@ -582,6 +594,7 @@ impl DefaultCompletedFetch {
             decode_expected_seq: 0,
             decode_inflight: 0,
             pending_decoded: BTreeMap::new(),
+            ready_decoded_batches: VecDeque::new(),
             decode_rx: None,
             decode_tx: None,
             no_more_raw_batches: true,
@@ -619,6 +632,7 @@ impl DefaultCompletedFetch {
             decode_expected_seq: 0,
             decode_inflight: 0,
             pending_decoded: BTreeMap::new(),
+            ready_decoded_batches: VecDeque::new(),
             decode_rx: None,
             decode_tx: None,
             no_more_raw_batches: true,
@@ -728,6 +742,19 @@ impl DefaultCompletedFetch {
         }
     }
 
+    fn wait_one_decode_result(&mut self) {
+        let Some(rx) = self.decode_rx.as_ref() else {
+            return;
+        };
+        let guard = match rx.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        if let Ok(result) = guard.recv_timeout(Duration::from_millis(5)) {
+            self.pending_decoded.insert(result.seq, result.result);
+        }
+    }
+
     fn next_decode_task(&mut self) -> Result<Option<DecodeTask>> {
         loop {
             let Some(log_batch_result) = self.log_record_batch.next() else {
@@ -762,6 +789,7 @@ impl DefaultCompletedFetch {
                 return Ok(None);
             };
             let next_fetch_offset = log_batch.next_log_offset();
+            let commit_timestamp = log_batch.commit_timestamp();
             let task = DecodeTask {
                 seq: self.decode_seq,
                 log_batch,
@@ -769,6 +797,8 @@ impl DefaultCompletedFetch {
                 skip_count,
                 effective_base_offset,
                 next_fetch_offset,
+                commit_timestamp,
+                change_type: ChangeType::AppendOnly,
                 result_tx: result_tx.clone(),
             };
             self.decode_seq += 1;
@@ -776,7 +806,7 @@ impl DefaultCompletedFetch {
         }
     }
 
-    fn fetch_batches_parallel(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
+    fn fetch_decoded_batches_parallel(&mut self, max_batches: usize) -> Result<Vec<DecodedBatch>> {
         if let Some(error) = self.error.take() {
             return Err(error);
         }
@@ -809,6 +839,10 @@ impl DefaultCompletedFetch {
             }
         }
 
+        if self.pending_decoded.is_empty() && self.decode_inflight > 0 {
+            self.wait_one_decode_result();
+        }
+
         let mut batches = Vec::with_capacity(max_batches.min(16));
         while batches.len() < max_batches {
             let Some(entry) = self.pending_decoded.remove(&self.decode_expected_seq) else {
@@ -817,9 +851,7 @@ impl DefaultCompletedFetch {
             let decoded = entry?;
             self.decode_expected_seq += 1;
             self.decode_inflight = self.decode_inflight.saturating_sub(1);
-            self.next_fetch_offset = decoded.next_fetch_offset;
-            self.records_read += decoded.record_batch.num_rows();
-            batches.push((decoded.record_batch, decoded.base_offset));
+            batches.push(decoded);
         }
 
         if self.no_more_raw_batches
@@ -830,6 +862,17 @@ impl DefaultCompletedFetch {
             self.drain();
         }
 
+        Ok(batches)
+    }
+
+    fn fetch_batches_parallel(&mut self, max_batches: usize) -> Result<Vec<(RecordBatch, i64)>> {
+        let decoded_batches = self.fetch_decoded_batches_parallel(max_batches)?;
+        let mut batches = Vec::with_capacity(decoded_batches.len());
+        for decoded in decoded_batches {
+            self.next_fetch_offset = decoded.next_fetch_offset;
+            self.records_read += decoded.record_batch.num_rows();
+            batches.push((decoded.record_batch, decoded.base_offset));
+        }
         Ok(batches)
     }
 }
@@ -873,33 +916,66 @@ impl CompletedFetch for DefaultCompletedFetch {
             return Ok(Vec::new());
         }
 
-        let mut scan_records = Vec::new();
+        let mut scan_records = Vec::with_capacity(max_records.min(1024));
+        self.last_record = None;
 
-        for _ in 0..max_records {
-            if self.cached_record_error.is_none() {
-                self.corrupt_last_record = true;
-                match self.next_fetched_record() {
-                    Ok(Some(record)) => {
-                        self.corrupt_last_record = false;
-                        self.last_record = Some(record);
-                    }
-                    Ok(None) => {
-                        self.corrupt_last_record = false;
-                        self.last_record = None;
-                    }
-                    Err(e) => {
-                        self.cached_record_error = Some(e.to_string());
-                    }
-                }
+        while scan_records.len() < max_records {
+            if self.cached_record_error.is_some() {
+                break;
             }
 
-            let Some(record) = self.last_record.take() else {
-                break;
-            };
+            if let Some(iter) = self.current_record_iterator.as_mut() {
+                let (_advanced, appended, exhausted) =
+                    iter.drain_to(&mut scan_records, max_records, self.next_fetch_offset);
+                if appended > 0 {
+                    self.records_read = self.records_read.saturating_add(appended);
+                    if let Some(last_record) = scan_records.last() {
+                        self.next_fetch_offset = last_record.offset() + 1;
+                    }
+                }
 
-            self.next_fetch_offset = record.offset() + 1;
-            self.records_read += 1;
-            scan_records.push(record);
+                if exhausted {
+                    self.current_record_iterator = None;
+                } else {
+                    break;
+                }
+                continue;
+            }
+
+            if self.decode_enabled() {
+                if self.ready_decoded_batches.is_empty() {
+                    let decoded_batches =
+                        self.fetch_decoded_batches_parallel(self.decode_inflight_limit.max(2))?;
+                    self.ready_decoded_batches.extend(decoded_batches);
+                }
+                let Some(decoded_batch) = self.ready_decoded_batches.pop_front() else {
+                    break;
+                };
+                self.current_record_iterator = Some(LogRecordIterator::from_record_batch(
+                    decoded_batch.record_batch,
+                    decoded_batch.base_offset,
+                    decoded_batch.commit_timestamp,
+                    decoded_batch.change_type,
+                ));
+                continue;
+            }
+
+            self.corrupt_last_record = true;
+            match self.next_fetched_record() {
+                Ok(Some(record)) => {
+                    self.corrupt_last_record = false;
+                    self.next_fetch_offset = record.offset() + 1;
+                    self.records_read += 1;
+                    scan_records.push(record);
+                }
+                Ok(None) => {
+                    self.corrupt_last_record = false;
+                    break;
+                }
+                Err(e) => {
+                    self.cached_record_error = Some(e.to_string());
+                }
+            }
         }
 
         if self.cached_record_error.is_some() && scan_records.is_empty() {
@@ -959,6 +1035,7 @@ impl CompletedFetch for DefaultCompletedFetch {
         self.corrupt_last_record = false;
         self.last_record = None;
         self.pending_decoded.clear();
+        self.ready_decoded_batches.clear();
         self.decode_rx = None;
         self.decode_tx = None;
     }
