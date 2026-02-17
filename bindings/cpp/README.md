@@ -32,11 +32,11 @@ bazel build //...
 ```
 `ci.sh` defaults to optimized builds via `-c opt` (override with `BAZEL_BUILD_FLAGS` if needed).
 See [ci.sh](ci.sh) for the CI build sequence.
+For integration into external Bazel workspaces, see [docs/cpp-bazel-usage.md](../../docs/cpp-bazel-usage.md).
 
 
 ## TODO
 
-- [] How to introduce fluss-cpp in your own project, https://github.com/apache/opendal/blob/main/bindings/cpp/README.md is a good reference
 - [ ] Add CMake/Bazel install and packaging instructions.
 - [ ] Document API usage and minimal example in this README.
 - [ ] Add more C++ examples (log scan, upsert, etc.).
